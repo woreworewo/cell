@@ -157,9 +157,15 @@ def cache_get(path: Path) -> dict | None:
 
 
 def cache_put(path: Path, data: dict) -> None:
-    CACHE_DIR.mkdir(exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2),
-                    encoding="utf-8")
+    try:
+        CACHE_DIR.mkdir(exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+    except OSError as e:
+        # Cache opsional - jangan gagalkan request kalau filesystem ngambek
+        import logging
+        logging.getLogger("cell_lookup").warning(
+            "cache write failed (%s): %s", path.name, e)
 
 
 # ---------------------------------------------------------------------------
