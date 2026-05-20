@@ -1,18 +1,17 @@
 """
-LTE Cell Lookup - detailed edition.
+LTE Cell Lookup - core + CLI.
+
+Ekspor fungsi `resolve()` untuk dipakai dari CLI maupun integrasi lain
+(contoh: bot Telegram).
 
 Fitur:
-  - Decode operator MCC/MNC offline (no API)
-  - Alamat terstruktur dari Nominatim (1 hit, dibagi per komponen)
+  - Decode operator MCC/MNC offline
+  - Alamat terstruktur dari Nominatim
   - Plus Code (Open Location Code) dari koordinat (offline)
   - Link ke Google / OSM / Bing / Waze / Apple Maps
-  - Akurasi, fallback flag, dan sisa balance dari Unwired Labs
-  - Cache lokal 30 hari supaya lookup berulang gratis
-
-Pakai:
-    python cell_lookup.py
-    python cell_lookup.py --mcc 510 --mnc 10 --enb 11071 --cid 1
-    python cell_lookup.py --no-cache
+  - Akurasi + fallback flag dari Unwired Labs
+  - Cache lokal 30 hari
+  - Multi-token rotate otomatis
 """
 
 from __future__ import annotations
@@ -23,19 +22,21 @@ import json
 import os
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import requests
 
 UWL_API = "https://ap1.unwiredlabs.com/v2/process.php"
 NOMINATIM_API = "https://nominatim.openstreetmap.org/reverse"
-USER_AGENT = "cell-lookup-cli/1.1"
+USER_AGENT = "cell-lookup-cli/1.2"
 CACHE_DIR = Path(__file__).with_name("cache")
 CACHE_TTL = 30 * 24 * 3600  # 30 hari
 
 
 # ---------------------------------------------------------------------------
-# MCC -> negara (subset; tambahkan sendiri kalau perlu)
+# Data MCC / MNC (subset)
 # ---------------------------------------------------------------------------
 MCC_COUNTRY = {
     "208": "France", "234": "United Kingdom", "262": "Germany",
@@ -49,7 +50,6 @@ MCC_COUNTRY = {
     "655": "South Africa", "724": "Brazil",
 }
 
-# MNC operator (fokus Indonesia, paling umum)
 MNC_OPERATOR = {
     ("510", "00"): "PSN",
     ("510", "01"): "Indosat Ooredoo Hutchison",
@@ -66,7 +66,6 @@ MNC_OPERATOR = {
     ("510", "88"): "Indosat",
     ("510", "89"): "Tri (Hutchison 3)",
     ("510", "99"): "Esia",
-    # contoh tambahan negara lain yang umum
     ("502", "12"): "Maxis (MY)",
     ("502", "13"): "Celcom (MY)",
     ("502", "16"): "DiGi (MY)",
@@ -79,17 +78,14 @@ MNC_OPERATOR = {
 def operator_info(mcc: int, mnc: int) -> tuple[str, str]:
     s_mcc = str(mcc)
     s_mnc = f"{mnc:02d}"
-    country = MCC_COUNTRY.get(s_mcc, "?")
-    operator = MNC_OPERATOR.get((s_mcc, s_mnc), "?")
-    return country, operator
+    return MCC_COUNTRY.get(s_mcc, "?"), MNC_OPERATOR.get((s_mcc, s_mnc), "?")
 
 
 # ---------------------------------------------------------------------------
-# Plus Code (Open Location Code) - 10-char pair encoding (~14m precision)
-# Ref: https://github.com/google/open-location-code
+# Plus Code
 # ---------------------------------------------------------------------------
 _OLC_ALPHABET = "23456789CFGHJMPQRVWX"
-_OLC_RESOLUTIONS = [20.0, 1.0, 0.05, 0.0025, 0.000125]
+_OLC_RES = [20.0, 1.0, 0.05, 0.0025, 0.000125]
 
 
 def plus_code(lat: float, lon: float) -> str:
@@ -97,24 +93,20 @@ def plus_code(lat: float, lon: float) -> str:
     lon = ((lon + 180) % 360) - 180
     if lat == 90:
         lat -= 0.000125
-    a_lat = lat + 90
-    a_lon = lon + 180
-
+    a_lat, a_lon = lat + 90, lon + 180
     code = ""
     for i in range(5):
-        place = _OLC_RESOLUTIONS[i]
-        d_lat = int(a_lat / place)
-        a_lat -= d_lat * place
-        d_lon = int(a_lon / place)
-        a_lon -= d_lon * place
+        place = _OLC_RES[i]
+        d_lat = int(a_lat / place); a_lat -= d_lat * place
+        d_lon = int(a_lon / place); a_lon -= d_lon * place
         code += _OLC_ALPHABET[d_lat] + _OLC_ALPHABET[d_lon]
-        if i == 3:  # setelah 8 char tambahkan separator
+        if i == 3:
             code += "+"
     return code
 
 
 # ---------------------------------------------------------------------------
-# Env loader & helpers
+# Env, helpers
 # ---------------------------------------------------------------------------
 def load_env(path: Path) -> None:
     if not path.exists():
@@ -127,15 +119,24 @@ def load_env(path: Path) -> None:
                                   v.strip().strip('"').strip("'"))
 
 
-def ask_int(label: str, default: int | None = None) -> int:
-    hint = f" [{default}]" if default is not None else ""
-    while True:
-        raw = input(f"{label}{hint}: ").strip()
-        if not raw and default is not None:
-            return default
-        if raw.lstrip("-").isdigit():
-            return int(raw)
-        print("  ! harus angka")
+def parse_tokens(raw: str) -> list[str]:
+    out: list[str] = []
+    for chunk in (raw or "").replace(";", ",").replace("\n", ",").split(","):
+        t = chunk.strip()
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
+def map_links(lat: float, lon: float) -> list[tuple[str, str]]:
+    return [
+        ("Google", f"https://www.google.com/maps?q={lat},{lon}"),
+        ("OSM",
+         f"https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=18/{lat}/{lon}"),
+        ("Bing", f"https://www.bing.com/maps?cp={lat}~{lon}&lvl=18"),
+        ("Waze", f"https://www.waze.com/ul?ll={lat}%2C{lon}&navigate=yes"),
+        ("Apple", f"https://maps.apple.com/?ll={lat},{lon}&z=18"),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -147,9 +148,7 @@ def cache_path(mcc: int, mnc: int, enb: int, cid: int) -> Path:
 
 
 def cache_get(path: Path) -> dict | None:
-    if not path.exists():
-        return None
-    if time.time() - path.stat().st_mtime > CACHE_TTL:
+    if not path.exists() or time.time() - path.stat().st_mtime > CACHE_TTL:
         return None
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -164,12 +163,9 @@ def cache_put(path: Path, data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# API calls
+# API
 # ---------------------------------------------------------------------------
 def _is_token_error(resp: dict) -> bool:
-    """Error yang berkaitan dengan token (quota habis / invalid / disabled).
-    Berbeda dengan error data (cell tidak ditemukan) yang tidak perlu rotate.
-    """
     msg = (resp.get("message") or "").lower()
     return any(s in msg for s in (
         "balance", "limit", "quota", "exhaust",
@@ -177,46 +173,39 @@ def _is_token_error(resp: dict) -> bool:
     ))
 
 
-def lookup(tokens: list[str], mcc: int, mnc: int, enb: int,
-           cid: int, exhausted: set[str]) -> tuple[dict, str | None]:
-    """Coba semua token sampai dapat ok atau semua kena masalah token.
-
-    Returns (response, token_yang_dipakai).
-    """
+def call_unwiredlabs(tokens: list[str], mcc: int, mnc: int, enb: int,
+                    cid: int, exhausted: set[str]) -> dict:
     payload_base = {
-        "radio": "lte",
-        "mcc": mcc,
-        "mnc": mnc,
-        "cells": [{"cid": enb * 256 + cid}],
-        "address": 1,
+        "radio": "lte", "mcc": mcc, "mnc": mnc,
+        "cells": [{"cid": enb * 256 + cid}], "address": 1,
     }
-
     last = {"status": "error", "message": "Tidak ada token yang bisa dipakai."}
+
     for token in tokens:
         if token in exhausted:
             continue
-
         body = dict(payload_base, token=token)
-        r = requests.post(UWL_API, json=body,
-                          headers={"User-Agent": USER_AGENT}, timeout=20)
-        r.raise_for_status()
-        resp = r.json()
-        last = resp
-
-        if resp.get("status") == "ok":
-            return resp, token
-
-        if _is_token_error(resp):
-            reason = resp.get("message", "?")
-            print(f"  ! token ...{token[-6:]} bermasalah ({reason}), "
-                  f"rotate ke berikutnya")
-            exhausted.add(token)
+        try:
+            r = requests.post(UWL_API, json=body,
+                              headers={"User-Agent": USER_AGENT}, timeout=20)
+            r.raise_for_status()
+            resp = r.json()
+        except requests.RequestException as e:
+            last = {"status": "error", "message": f"Network error: {e}"}
+            continue
+        except ValueError:
+            last = {"status": "error", "message": "Response bukan JSON."}
             continue
 
-        # Error data (cell tidak ada, dll) - hentikan rotasi
-        return resp, token
+        last = resp
+        if resp.get("status") == "ok":
+            return resp
+        if _is_token_error(resp):
+            exhausted.add(token)
+            continue
+        return resp  # error data, jangan rotate
 
-    return last, None
+    return last
 
 
 def reverse_geocode(lat: float, lon: float) -> dict:
@@ -232,106 +221,118 @@ def reverse_geocode(lat: float, lon: float) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Output
+# High-level resolver
 # ---------------------------------------------------------------------------
-def map_links(lat: float, lon: float) -> list[tuple[str, str]]:
-    return [
-        ("Google", f"https://www.google.com/maps?q={lat},{lon}"),
-        ("OSM",
-         f"https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=18/{lat}/{lon}"),
-        ("Bing", f"https://www.bing.com/maps?cp={lat}~{lon}&lvl=18"),
-        ("Waze", f"https://www.waze.com/ul?ll={lat}%2C{lon}&navigate=yes"),
-        ("Apple", f"https://maps.apple.com/?ll={lat},{lon}&z=18"),
-    ]
+@dataclass
+class Result:
+    ok: bool
+    mcc: int
+    mnc: int
+    enb: int
+    cid: int
+    country: str = ""
+    operator: str = ""
+    lat: float | None = None
+    lon: float | None = None
+    accuracy: float | None = None
+    fallback: str | None = None
+    plus_code: str = ""
+    address_components: dict = field(default_factory=dict)
+    display_name: str = ""
+    from_cache: bool = False
+    error: str = ""
+
+    @property
+    def cid_full(self) -> int:
+        return self.enb * 256 + self.cid
 
 
-def show(inputs: dict, resp: dict, from_cache: bool) -> None:
-    tag = " (cache)" if from_cache else ""
-    print(f"\n--- Hasil{tag} ---")
+def resolve(mcc: int, mnc: int, enb: int, cid: int,
+            tokens: list[str], exhausted: set[str] | None = None,
+            use_cache: bool = True) -> Result:
+    """One-shot lookup; returns Result."""
+    exhausted = exhausted if exhausted is not None else set()
+    country, operator = operator_info(mcc, mnc)
+    base = Result(ok=False, mcc=mcc, mnc=mnc, enb=enb, cid=cid,
+                  country=country, operator=operator)
 
-    country, operator = operator_info(inputs["mcc"], inputs["mnc"])
-    cid_full = inputs["enb"] * 256 + inputs["cid"]
+    cpath = cache_path(mcc, mnc, enb, cid)
+    resp: dict[str, Any] | None = cache_get(cpath) if use_cache else None
+    from_cache = resp is not None
 
-    print(f"  Negara   : {country}")
-    print(f"  Operator : {operator}")
-    print(f"  MCC/MNC  : {inputs['mcc']}/{inputs['mnc']:02d}")
-    print(f"  eNB      : {inputs['enb']}  sektor {inputs['cid']}  "
-          f"(CID {cid_full})")
+    if resp is None:
+        if not tokens:
+            base.error = "UWL_TOKEN belum diset."
+            return base
+        resp = call_unwiredlabs(tokens, mcc, mnc, enb, cid, exhausted)
+        if resp.get("status") == "ok" and use_cache:
+            cache_put(cpath, resp)
 
+    base.from_cache = from_cache
     if resp.get("status") != "ok":
-        print(f"  Status   : {resp.get('status', 'error')}")
-        print(f"  Pesan    : "
-              f"{resp.get('message', 'Database tidak ditemukan.')}")
+        base.error = resp.get("message") or "Database tidak ditemukan."
+        return base
+
+    lat, lon = float(resp["lat"]), float(resp["lon"])
+    base.ok = True
+    base.lat, base.lon = lat, lon
+    base.accuracy = resp.get("accuracy")
+    base.fallback = resp.get("fallback")
+    base.plus_code = plus_code(lat, lon)
+
+    geo = reverse_geocode(lat, lon)
+    base.address_components = geo.get("address") or {}
+    base.display_name = geo.get("display_name") or resp.get("address") or ""
+    return base
+
+
+# ---------------------------------------------------------------------------
+# CLI presentation
+# ---------------------------------------------------------------------------
+def ask_int(label: str, default: int | None = None) -> int:
+    hint = f" [{default}]" if default is not None else ""
+    while True:
+        raw = input(f"{label}{hint}: ").strip()
+        if not raw and default is not None:
+            return default
+        if raw.lstrip("-").isdigit():
+            return int(raw)
+        print("  ! harus angka")
+
+
+def print_result(r: Result) -> None:
+    tag = " (cache)" if r.from_cache else ""
+    print(f"\n--- Hasil{tag} ---")
+    print(f"  Negara   : {r.country}")
+    print(f"  Operator : {r.operator}")
+    print(f"  MCC/MNC  : {r.mcc}/{r.mnc:02d}")
+    print(f"  eNB      : {r.enb}  sektor {r.cid}  (CID {r.cid_full})")
+
+    if not r.ok:
+        print(f"  Status   : error")
+        print(f"  Pesan    : {r.error}")
         return
 
-    lat, lon = resp["lat"], resp["lon"]
-    accuracy = resp.get("accuracy", "?")
-    fallback = resp.get("fallback")
+    print(f"  Lat,Lon  : {r.lat}, {r.lon}")
+    acc = f"± {r.accuracy} m" if r.accuracy is not None else "?"
+    if r.fallback:
+        acc += f"  (fallback: {r.fallback})"
+    print(f"  Akurasi  : {acc}")
+    print(f"  PlusCode : {r.plus_code}")
 
-    print(f"  Lat,Lon  : {lat}, {lon}")
-    acc_line = f"± {accuracy} m"
-    if fallback:
-        acc_line += f"  (fallback: {fallback})"
-    print(f"  Akurasi  : {acc_line}")
-    print(f"  PlusCode : {plus_code(lat, lon)}")
-
-    # Reverse geocode (optional, gratis dari OSM)
-    geo = reverse_geocode(lat, lon)
-    addr = geo.get("address") or {}
-    if addr:
+    if r.address_components:
         print("  Alamat   :")
         for k in ("road", "neighbourhood", "suburb", "village", "town",
                   "city", "county", "state", "postcode", "country"):
-            v = addr.get(k)
+            v = r.address_components.get(k)
             if v:
                 print(f"    - {k:11}: {v}")
-    elif resp.get("address"):
-        print(f"  Alamat   : {resp['address']}")
+    elif r.display_name:
+        print(f"  Alamat   : {r.display_name}")
 
     print("  Map      :")
-    for name, url in map_links(lat, lon):
+    for name, url in map_links(r.lat, r.lon):
         print(f"    - {name:7}: {url}")
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-def run_once(args: argparse.Namespace, tokens: list[str],
-             exhausted: set[str]) -> None:
-    inputs = {
-        "mcc": args.mcc if args.mcc is not None else ask_int("MCC", 510),
-        "mnc": args.mnc if args.mnc is not None else ask_int("MNC", 10),
-        "enb": args.enb if args.enb is not None else ask_int("eNB"),
-        "cid": args.cid if args.cid is not None else ask_int("CID", 1),
-    }
-    cpath = cache_path(**inputs)
-
-    if not args.no_cache:
-        cached = cache_get(cpath)
-        if cached:
-            show(inputs, cached, from_cache=True)
-            return
-
-    try:
-        resp, _ = lookup(tokens, exhausted=exhausted, **inputs)
-    except requests.RequestException as e:
-        print(f"\n  ! error: {e}")
-        return
-
-    if resp.get("status") == "ok" and not args.no_cache:
-        cache_put(cpath, resp)
-
-    show(inputs, resp, from_cache=False)
-
-
-def parse_tokens(raw: str) -> list[str]:
-    """Pisah token berdasarkan koma / titik koma / whitespace."""
-    out: list[str] = []
-    for chunk in raw.replace(";", ",").replace("\n", ",").split(","):
-        t = chunk.strip()
-        if t and t not in out:  # buang duplikat, jaga urutan
-            out.append(t)
-    return out
 
 
 def main() -> None:
@@ -343,9 +344,8 @@ def main() -> None:
     p.add_argument("--enb", type=int)
     p.add_argument("--cid", type=int)
     p.add_argument("--token", default=os.environ.get("UWL_TOKEN", ""),
-                   help="Token UWL. Boleh banyak, dipisah koma.")
-    p.add_argument("--no-cache", action="store_true",
-                   help="Abaikan cache, paksa hit API")
+                   help="Token UWL (boleh banyak, dipisah koma)")
+    p.add_argument("--no-cache", action="store_true")
     args = p.parse_args()
 
     tokens = parse_tokens(args.token)
@@ -361,8 +361,15 @@ def main() -> None:
         if len(exhausted) >= len(tokens):
             print("\n! Semua token sudah kena limit. Berhenti.")
             break
+        mcc = args.mcc if args.mcc is not None else ask_int("MCC", 510)
+        mnc = args.mnc if args.mnc is not None else ask_int("MNC", 10)
+        enb = args.enb if args.enb is not None else ask_int("eNB")
+        cid = args.cid if args.cid is not None else ask_int("CID", 1)
 
-        run_once(args, tokens, exhausted)
+        result = resolve(mcc, mnc, enb, cid, tokens, exhausted,
+                         use_cache=not args.no_cache)
+        print_result(result)
+
         if one_shot:
             break
         if input("\nLagi? (y/N): ").strip().lower() not in ("y", "ya", "yes"):

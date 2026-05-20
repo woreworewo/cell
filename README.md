@@ -66,6 +66,60 @@ Hasil sukses disimpan di `cache/*.json` selama 30 hari. Lookup berulang
 tidak menghabiskan kuota. Cache dimatikan untuk satu run dengan `--no-cache`,
 atau hapus folder `cache/` untuk reset total.
 
+## Bot Telegram
+
+Wrapper bot pakai `bot.py`. Siapapun yang tahu username bot bisa pakai,
+dengan rate limit per user (default 5 menit).
+
+### Setup
+
+1. Bikin bot di [@BotFather](https://t.me/BotFather), copy token-nya.
+2. Tambah ke `.env`:
+
+   ```
+   TG_BOT_TOKEN=123456:ABC-DEF...
+   TG_RATE_LIMIT_SEC=300
+   TG_DEFAULT_MCC=510
+   TG_DEFAULT_MNC=10
+   ```
+
+3. Install dependency dan jalankan:
+
+   ```cmd
+   pip install -r requirements.txt
+   python bot.py
+   ```
+
+### Pakai
+
+Di chat dengan bot:
+
+- `/cell 510 10 11071 1` - format lengkap
+- `/cell 11071 1` - pakai default MCC/MNC dari `.env`
+- `/cell 510-10-11071-1` - separator alternatif (`-`, `/`, `,`, `_`)
+- `/start` atau `/help` - bantuan
+
+Bot membalas dengan:
+- Info operator + koordinat + akurasi + alamat + Plus Code
+- Telegram Location native (titik di peta dalam chat)
+- Tombol inline ke Google / OSM / Bing / Waze / Apple Maps
+
+### Konfigurasi `.env`
+
+| Variable | Default | Deskripsi |
+|---|---|---|
+| `TG_BOT_TOKEN` | - | Wajib. Dari @BotFather. |
+| `TG_BOT_NAME` | LTE Cell Lookup | Nama di /start. |
+| `TG_RATE_LIMIT_SEC` | 300 | Jeda min antar request per user (detik). |
+| `TG_DEFAULT_MCC` | 510 | MCC default kalau user kasih 2 angka saja. |
+| `TG_DEFAULT_MNC` | 10 | MNC default. |
+| `TG_INCLUDE_LOCATION` | 1 | Kirim Telegram Location native. |
+| `TG_INCLUDE_ADDRESS` | 1 | Tampilkan alamat. |
+| `TG_INCLUDE_MAP_BUTTONS` | 1 | Tombol map links. |
+| `TG_INCLUDE_PLUS_CODE` | 1 | Tampilkan Plus Code. |
+
+
+
 ## Rumus CID
 
 ```
