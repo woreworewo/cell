@@ -1,0 +1,16 @@
+services:
+  bot:
+    build: .
+    image: cell-lookup-bot:latest
+    container_name: cell-lookup-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./cache:/app/cache
+    # Bot pakai polling, tidak buka port. Logging ke stdout (lihat dengan
+    # `docker compose logs -f`).
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
