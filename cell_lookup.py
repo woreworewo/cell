@@ -175,6 +175,9 @@ def _is_token_error(resp: dict) -> bool:
 
 def call_unwiredlabs(tokens: list[str], mcc: int, mnc: int, enb: int,
                     cid: int, exhausted: set[str]) -> dict:
+    import logging
+    log = logging.getLogger("cell_lookup")
+
     payload_base = {
         "radio": "lte", "mcc": mcc, "mnc": mnc,
         "cells": [{"cid": enb * 256 + cid}], "address": 1,
@@ -201,6 +204,8 @@ def call_unwiredlabs(tokens: list[str], mcc: int, mnc: int, enb: int,
         if resp.get("status") == "ok":
             return resp
         if _is_token_error(resp):
+            log.info("token ...%s exhausted: %s", token[-6:],
+                     resp.get("message"))
             exhausted.add(token)
             continue
         return resp  # error data, jangan rotate
