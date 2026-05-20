@@ -70,6 +70,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO,
 )
+# Silence library chatter (HTTP polling requests, etc.)
+for noisy in ("httpx", "httpcore", "telegram.ext.Application",
+              "telegram.ext.Updater"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 
