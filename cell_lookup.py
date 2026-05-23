@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import sys
 import time
@@ -103,6 +104,103 @@ def plus_code(lat: float, lon: float) -> str:
         if i == 3:
             code += "+"
     return code
+
+
+# ---------------------------------------------------------------------------
+# Azimuth & geometri arah sinyal
+# ---------------------------------------------------------------------------
+# Mayoritas eNB LTE 3-sektor dengan antena 120° terpisah.
+# Offset default mengikuti konvensi Telkomsel/Indosat di Indonesia:
+#   sektor 1 -> 0° (Utara), 2 -> 120°, 3 -> 240°.
+# Bisa di-override via env SECTOR_AZIMUTHS (CSV, urutan sektor 1..N) atau
+# per-operator via SECTOR_AZIMUTHS_<MCC>_<MNC>.
+DEFAULT_SECTOR_AZIMUTHS = (0.0, 120.0, 240.0)
+DEFAULT_BEAMWIDTH_DEG = 65.0  # tipikal antena panel 3-sektor
+
+_COMPASS_16 = (
+    "Utara", "Utara-Timur Laut", "Timur Laut", "Timur-Timur Laut",
+    "Timur", "Timur-Tenggara", "Tenggara", "Selatan-Tenggara",
+    "Selatan", "Selatan-Barat Daya", "Barat Daya", "Barat-Barat Daya",
+    "Barat", "Barat-Barat Laut", "Barat Laut", "Utara-Barat Laut",
+)
+
+
+def compass_label(deg: float) -> str:
+    idx = int((deg % 360) / 22.5 + 0.5) % 16
+    return _COMPASS_16[idx]
+
+
+def _parse_azimuths(raw: str) -> tuple[float, ...] | None:
+    if not raw:
+        return None
+    try:
+        vals = tuple(float(x.strip()) % 360 for x in raw.split(",")
+                     if x.strip())
+        return vals or None
+    except ValueError:
+        return None
+
+
+def sector_azimuths(mcc: int, mnc: int) -> tuple[float, ...]:
+    """Resolve daftar azimuth sektor (urutan sektor 1..N), jatuh ke default."""
+    key = f"SECTOR_AZIMUTHS_{mcc}_{mnc:02d}"
+    for env_key in (key, "SECTOR_AZIMUTHS"):
+        vals = _parse_azimuths(os.environ.get(env_key, ""))
+        if vals:
+            return vals
+    return DEFAULT_SECTOR_AZIMUTHS
+
+
+def estimate_azimuth(mcc: int, mnc: int, sector: int) -> float | None:
+    """Perkiraan arah pancar antena untuk nomor sektor (1-based).
+    Return None kalau sektor di luar tabel.
+    """
+    azimuths = sector_azimuths(mcc, mnc)
+    if sector < 1 or sector > len(azimuths):
+        return None
+    return azimuths[sector - 1]
+
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Jarak dua titik di permukaan bumi (meter)."""
+    r = 6371008.8
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Bearing initial dari titik 1 ke titik 2, derajat 0-360 (0 = Utara)."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dl = math.radians(lon2 - lon1)
+    x = math.sin(dl) * math.cos(p2)
+    y = (math.cos(p1) * math.sin(p2)
+         - math.sin(p1) * math.cos(p2) * math.cos(dl))
+    return (math.degrees(math.atan2(x, y)) + 360) % 360
+
+
+def angular_diff(a: float, b: float) -> float:
+    """Selisih sudut absolut terkecil antara dua bearing (0-180)."""
+    d = abs((a - b + 180) % 360 - 180)
+    return d
+
+
+def best_serving_sector(mcc: int, mnc: int,
+                        bearing_to_user: float) -> tuple[int, float]:
+    """Cari sektor mana yang paling dekat arah pancarnya ke user.
+    Return (sector_number, off_axis_deg).
+    """
+    azimuths = sector_azimuths(mcc, mnc)
+    best_idx = 0
+    best_diff = 360.0
+    for i, az in enumerate(azimuths):
+        d = angular_diff(az, bearing_to_user)
+        if d < best_diff:
+            best_diff = d
+            best_idx = i
+    return best_idx + 1, best_diff
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +346,8 @@ class Result:
     accuracy: float | None = None
     fallback: str | None = None
     plus_code: str = ""
+    azimuth: float | None = None
+    beamwidth: float = DEFAULT_BEAMWIDTH_DEG
     address_components: dict = field(default_factory=dict)
     display_name: str = ""
     from_cache: bool = False
@@ -256,6 +356,10 @@ class Result:
     @property
     def cid_full(self) -> int:
         return self.enb * 256 + self.cid
+
+    @property
+    def azimuth_label(self) -> str:
+        return compass_label(self.azimuth) if self.azimuth is not None else ""
 
 
 def resolve(mcc: int, mnc: int, enb: int, cid: int,
@@ -290,6 +394,7 @@ def resolve(mcc: int, mnc: int, enb: int, cid: int,
     base.accuracy = resp.get("accuracy")
     base.fallback = resp.get("fallback")
     base.plus_code = plus_code(lat, lon)
+    base.azimuth = estimate_azimuth(mcc, mnc, cid)
 
     geo = reverse_geocode(lat, lon)
     base.address_components = geo.get("address") or {}
@@ -330,6 +435,9 @@ def print_result(r: Result) -> None:
         acc += f"  (fallback: {r.fallback})"
     print(f"  Akurasi  : {acc}")
     print(f"  PlusCode : {r.plus_code}")
+    if r.azimuth is not None:
+        print(f"  Azimuth  : ~{r.azimuth:.0f}° ({r.azimuth_label}) "
+              f"[estimasi, beamwidth ~{r.beamwidth:.0f}°]")
 
     if r.address_components:
         print("  Alamat   :")
