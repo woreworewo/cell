@@ -1,22 +1,4 @@
 """
-CLI Tool untuk mengimpor file data OpenCellID CSV (misal data/510.csv) ke database SQLite.
-
-Penggunaan:
-    python import_csv.py
-    python import_csv.py data/510.csv
-    python import_csv.py data/510.csv --db data/cells.db
-"""
-
-from __future__ import annotations
-
-import argparse
-import sys
-from pathlib import Path
-
-from db import DATA_DIR, DB_PATH, DEFAULT_CSV, get_db_stats, import_csv_to_sqlite
-
-
-"""
 CLI Tool untuk mengimpor file data OpenCellID CSV ke database SQLite.
 
 Mendukung:
