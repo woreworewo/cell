@@ -369,7 +369,8 @@ def resolve(mcc: int, mnc: int, enb: int, cid: int,
             tokens: list[str] | None = None,
             exhausted: set[str] | None = None,
             use_cache: bool = True,
-            use_local_db: bool = True) -> Result:
+            use_local_db: bool = True,
+            geocode: bool = True) -> Result:
     """One-shot lookup; returns Result."""
     tokens = tokens or []
     exhausted = exhausted if exhausted is not None else set()
@@ -419,9 +420,13 @@ def resolve(mcc: int, mnc: int, enb: int, cid: int,
     base.plus_code = plus_code(lat, lon)
     base.azimuth = estimate_azimuth(mcc, mnc, cid)
 
-    geo = reverse_geocode(lat, lon)
-    base.address_components = geo.get("address") or {}
-    base.display_name = geo.get("display_name") or resp.get("address") or ""
+    if geocode:
+        geo = reverse_geocode(lat, lon)
+        base.address_components = geo.get("address") or {}
+        base.display_name = geo.get("display_name") or resp.get("address") or ""
+    else:
+        base.display_name = resp.get("address") or ""
+
     return base
 
 

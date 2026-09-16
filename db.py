@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -122,6 +123,8 @@ def import_csv_to_sqlite(csv_path: Path = DEFAULT_CSV,
     cur.execute("CREATE INDEX idx_cells_lookup ON cells (mcc, net, cell)")
     # Index tambahan untuk lookup LTE/radio
     cur.execute("CREATE INDEX idx_cells_radio ON cells (radio)")
+    # Index koordinat untuk radius search
+    cur.execute("CREATE INDEX idx_cells_coords ON cells (lat, lon)")
 
     conn.commit()
     conn.close()
@@ -141,6 +144,14 @@ def ensure_db(force: bool = False) -> bool:
     Jika belum ada dan file 510.csv tersedia, lakukan impor otomatis.
     """
     if DB_PATH.exists() and not force:
+        # Pastikan index koordinat sudah ada
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_cells_coords ON cells (lat, lon)"
+                )
+        except Exception:
+            pass
         return True
 
     if not DEFAULT_CSV.exists():
@@ -200,6 +211,164 @@ def query_local_db(mcc: int, mnc: int, enb: int, cid: int,
     except Exception as e:
         log.warning("Gagal query database lokal: %s", e)
         return None
+
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371008.8
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dl = math.radians(lon2 - lon1)
+    x = math.sin(dl) * math.cos(p2)
+    y = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return (math.degrees(math.atan2(x, y)) + 360) % 360
+
+
+_COMPASS_16 = (
+    "Utara", "Utara-Timur Laut", "Timur Laut", "Timur-Timur Laut",
+    "Timur", "Timur-Tenggara", "Tenggara", "Selatan-Tenggara",
+    "Selatan", "Selatan-Barat Daya", "Barat Daya", "Barat-Barat Daya",
+    "Barat", "Barat-Barat Laut", "Barat Laut", "Utara-Barat Laut",
+)
+
+
+def _compass_label(deg: float) -> str:
+    idx = int((deg % 360) / 22.5 + 0.5) % 16
+    return _COMPASS_16[idx]
+
+
+def query_nearby_cells(
+    lat: float,
+    lon: float,
+    radius_m: float = 1500.0,
+    limit: int = 10,
+    mcc: int | None = None,
+    mnc: int | None = None,
+    radio: str | None = None,
+    db_path: Path = DB_PATH,
+) -> list[dict[str, Any]]:
+    """Cari tower di sekitar titik koordinat (radius_m meter).
+
+    Mengelompokkan sektor LTE yang berada pada eNB yang sama menjadi satu site.
+    Mengembalikan list tower terdekat diurutkan dari jarak terdekat.
+    """
+    if not db_path.exists():
+        if not ensure_db():
+            return []
+
+    # Hitung bounding box kasar
+    lat_delta = radius_m / 111139.0
+    cos_lat = max(0.01, math.cos(math.radians(lat)))
+    lon_delta = radius_m / (111139.0 * cos_lat)
+
+    min_lat, max_lat = lat - lat_delta, lat + lat_delta
+    min_lon, max_lon = lon - lon_delta, lon + lon_delta
+
+    clauses = ["lat BETWEEN ? AND ?", "lon BETWEEN ? AND ?"]
+    params: list[Any] = [min_lat, max_lat, min_lon, max_lon]
+
+    if mcc is not None:
+        clauses.append("mcc = ?")
+        params.append(mcc)
+    if mnc is not None:
+        clauses.append("net = ?")
+        params.append(mnc)
+    if radio is not None:
+        clauses.append("radio = ?")
+        params.append(radio.upper())
+
+    where_sql = " AND ".join(clauses)
+    query_sql = f"""
+        SELECT radio, mcc, net, area, cell, unit, lon, lat, range, updated
+        FROM cells
+        WHERE {where_sql}
+    """
+
+    # Lazy import operator_info untuk cegah circular import
+    try:
+        from cell_lookup import operator_info
+    except ImportError:
+        operator_info = lambda mc, mn: ("Indonesia" if str(mc) == "510" else "?", "?")
+
+    sites: dict[tuple, dict[str, Any]] = {}
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(query_sql, params)
+            rows = cur.fetchall()
+
+            for row in rows:
+                r_lat = float(row["lat"])
+                r_lon = float(row["lon"])
+                dist = _haversine_m(lat, lon, r_lat, r_lon)
+                if dist > radius_m:
+                    continue
+
+                r_mcc = int(row["mcc"])
+                r_mnc = int(row["net"])
+                r_radio = row["radio"]
+                r_cell = int(row["cell"])
+                r_area = row["area"]
+
+                if r_radio == "LTE":
+                    enb = r_cell // 256
+                    cid = r_cell % 256
+                    site_key = ("LTE", r_mcc, r_mnc, enb)
+                else:
+                    enb = r_cell
+                    cid = r_cell
+                    site_key = (r_radio, r_mcc, r_mnc, r_cell)
+
+                if site_key not in sites:
+                    bearing = _bearing_deg(lat, lon, r_lat, r_lon)
+                    country, operator = operator_info(r_mcc, r_mnc)
+                    sites[site_key] = {
+                        "radio": r_radio,
+                        "mcc": r_mcc,
+                        "mnc": r_mnc,
+                        "enb": enb,
+                        "country": country,
+                        "operator": operator,
+                        "area": r_area,
+                        "lat": r_lat,
+                        "lon": r_lon,
+                        "distance_m": dist,
+                        "bearing": round(bearing, 1),
+                        "direction": _compass_label(bearing),
+                        "sectors": {cid} if r_radio == "LTE" else {r_cell},
+                        "accuracy": row["range"],
+                    }
+                else:
+                    curr = sites[site_key]
+                    if r_radio == "LTE":
+                        curr["sectors"].add(cid)
+                    if dist < curr["distance_m"]:
+                        curr["distance_m"] = dist
+                        curr["lat"] = r_lat
+                        curr["lon"] = r_lon
+                        b = _bearing_deg(lat, lon, r_lat, r_lon)
+                        curr["bearing"] = round(b, 1)
+                        curr["direction"] = _compass_label(b)
+
+    except Exception as e:
+        log.warning("Gagal radius search database lokal: %s", e)
+        return []
+
+    results = list(sites.values())
+    for item in results:
+        item["sectors"] = sorted(list(item["sectors"]))
+        item["distance_m"] = round(item["distance_m"], 1)
+
+    results.sort(key=lambda x: x["distance_m"])
+    return results[:limit]
 
 
 def get_db_stats(db_path: Path = DB_PATH) -> dict[str, Any]:

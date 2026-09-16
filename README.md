@@ -116,12 +116,13 @@ Di chat dengan bot:
 - `/cell 11071 1` - pakai default MCC/MNC dari `.env`
 - `/cell 510-10-11071-1` - separator alternatif (`-`, `/`, `,`, `_`)
 - `/enb 11071` - sweep semua sektor sekaligus, list azimuth tiap sektor
+- `/batch` - lookup banyak cell sekaligus (maks 20 cell, multi-line atau dipisah koma)
+- `/nearby [radius]` - cari semua tower di sekitar koordinat/lokasi Anda
 - `/start` atau `/help` - bantuan
 
-**Bonus arah sinyal:** setelah `/cell` atau `/enb` sukses, share lokasi
-kamu lewat klip 📎 → Location. Bot akan balas dengan jarak ke tower,
-bearing arah tower, dan tebakan sektor mana yang seharusnya melayani
-posisi kamu.
+**Fitur Lokasi & Antena:**
+- Setelah `/cell` atau `/enb` sukses, share lokasi kamu lewat klip 📎 → Location. Bot akan balas dengan jarak ke tower, bearing arah tower, dan tebakan sektor mana yang seharusnya melayani posisi kamu.
+- Share lokasi langsung tanpa `/cell` untuk menampilkan semua tower BTS dari berbagai operator di sekitar radius kamu (default 1.5 km).
 
 Bot membalas dengan:
 - Info operator + koordinat + akurasi + alamat + Plus Code
@@ -135,7 +136,7 @@ Bot membalas dengan:
 |---|---|---|
 | `TG_BOT_TOKEN` | - | Wajib. Dari @BotFather. |
 | `TG_BOT_NAME` | LTE Cell Lookup | Nama di /start. |
-| `TG_RATE_LIMIT_SEC` | 300 | Jeda min antar request per user (detik). |
+| `TG_RATE_LIMIT_SEC` | 3 | Jeda min antar request per user (detik). |
 | `TG_DEFAULT_MCC` | 510 | MCC default kalau user kasih 2 angka saja. |
 | `TG_DEFAULT_MNC` | 10 | MNC default. |
 | `TG_INCLUDE_LOCATION` | 1 | Kirim Telegram Location native. |
