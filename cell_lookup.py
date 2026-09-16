@@ -29,7 +29,7 @@ from typing import Any
 
 import requests
 
-from db import ensure_db, query_local_db
+from db import ensure_db, query_local_db, query_local_db_lac_ci
 
 UWL_API = "https://ap1.unwiredlabs.com/v2/process.php"
 NOMINATIM_API = "https://nominatim.openstreetmap.org/reverse"
@@ -242,8 +242,17 @@ def map_links(lat: float, lon: float) -> list[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 # Cache
 # ---------------------------------------------------------------------------
-def cache_path(mcc: int, mnc: int, enb: int, cid: int) -> Path:
-    raw = f"lte:{mcc}:{mnc}:{enb}:{cid}".encode()
+def cache_path(mcc: int, mnc: int, enb_or_cid: int,
+               cid_or_lac: int | None = None,
+               lac: int | None = None,
+               radio: str = "lte") -> Path:
+    if lac is not None:
+        raw = f"{radio.lower()}:{mcc}:{mnc}:{lac}:{enb_or_cid}".encode()
+    elif cid_or_lac is not None and cid_or_lac <= 255:
+        # eNB + sector LTE
+        raw = f"lte:{mcc}:{mnc}:{enb_or_cid}:{cid_or_lac}".encode()
+    else:
+        raw = f"{radio.lower()}:{mcc}:{mnc}:{cid_or_lac or 0}:{enb_or_cid}".encode()
     return CACHE_DIR / f"{hashlib.sha1(raw).hexdigest()[:16]}.json"
 
 
@@ -279,14 +288,30 @@ def _is_token_error(resp: dict) -> bool:
     ))
 
 
-def call_unwiredlabs(tokens: list[str], mcc: int, mnc: int, enb: int,
-                    cid: int, exhausted: set[str]) -> dict:
+def call_unwiredlabs(tokens: list[str], mcc: int, mnc: int,
+                     enb_or_cid: int, cid: int | None = None,
+                     exhausted: set[str] | None = None,
+                     lac: int | None = None,
+                     radio: str = "lte",
+                     cid_full: int | None = None) -> dict:
     import logging
     log = logging.getLogger("cell_lookup")
+    exhausted = exhausted if exhausted is not None else set()
+
+    if cid_full is not None:
+        target_cid = cid_full
+    elif cid is not None and cid <= 255:
+        target_cid = enb_or_cid * 256 + cid
+    else:
+        target_cid = enb_or_cid
+
+    cell_obj: dict[str, Any] = {"cid": target_cid}
+    if lac is not None:
+        cell_obj["lac"] = lac
 
     payload_base = {
-        "radio": "lte", "mcc": mcc, "mnc": mnc,
-        "cells": [{"cid": enb * 256 + cid}], "address": 1,
+        "radio": radio.lower(), "mcc": mcc, "mnc": mnc,
+        "cells": [cell_obj], "address": 1,
     }
     last = {"status": "error", "message": "Tidak ada token yang bisa dipakai."}
 
@@ -339,8 +364,11 @@ class Result:
     ok: bool
     mcc: int
     mnc: int
-    enb: int
-    cid: int
+    enb: int | None = None
+    cid: int | None = None
+    lac: int | None = None
+    ci: int | None = None
+    radio: str = "LTE"
     country: str = ""
     operator: str = ""
     lat: float | None = None
@@ -358,24 +386,56 @@ class Result:
 
     @property
     def cid_full(self) -> int:
-        return self.enb * 256 + self.cid
+        if self.ci is not None:
+            return self.ci
+        if self.radio.upper() == "LTE" and self.enb is not None and self.cid is not None:
+            return self.enb * 256 + self.cid
+        return self.cid or 0
 
     @property
     def azimuth_label(self) -> str:
         return compass_label(self.azimuth) if self.azimuth is not None else ""
 
 
-def resolve(mcc: int, mnc: int, enb: int, cid: int,
+def resolve(mcc: int = 510,
+            mnc: int = 10,
+            enb: int | None = None,
+            cid: int | None = None,
+            lac: int | None = None,
+            ci: int | None = None,
+            radio: str | None = None,
             tokens: list[str] | None = None,
             exhausted: set[str] | None = None,
             use_cache: bool = True,
             use_local_db: bool = True,
             geocode: bool = True) -> Result:
-    """One-shot lookup; returns Result."""
+    """One-shot lookup; returns Result.
+
+    Bisa dipanggil dengan:
+      - enb & cid (format 4G LTE)
+      - lac & ci (format 2G/3G/4G)
+      - ci saja (ECI 4G)
+    """
     tokens = tokens or []
     exhausted = exhausted if exhausted is not None else set()
+
+    if ci is None:
+        if enb is not None and cid is not None:
+            ci = enb * 256 + cid
+            radio = radio or "LTE"
+        else:
+            return Result(ok=False, mcc=mcc, mnc=mnc,
+                          error="Harus mengisi eNB & CID atau LAC & CI.")
+    else:
+        if radio is None:
+            radio = "LTE" if ci > 65535 else "GSM"
+        if radio.upper() == "LTE" and enb is None and cid is None:
+            enb = ci // 256
+            cid = ci % 256
+
     country, operator = operator_info(mcc, mnc)
     base = Result(ok=False, mcc=mcc, mnc=mnc, enb=enb, cid=cid,
+                  lac=lac, ci=ci, radio=radio or "LTE",
                   country=country, operator=operator)
 
     resp: dict[str, Any] | None = None
@@ -383,12 +443,24 @@ def resolve(mcc: int, mnc: int, enb: int, cid: int,
 
     # 1. Cek database lokal SQLite (OpenCellID)
     if use_local_db:
-        resp = query_local_db(mcc, mnc, enb, cid)
+        resp = query_local_db_lac_ci(mcc=mcc, mnc=mnc, lac=lac, ci=ci, radio=radio)
         if resp:
             source = "local_db"
+            base.mcc = resp.get("mcc", base.mcc)
+            base.mnc = resp.get("mnc", base.mnc)
+            base.country, base.operator = operator_info(base.mcc, base.mnc)
+            base.radio = resp.get("radio", base.radio)
+            if resp.get("area") is not None:
+                base.lac = resp["area"]
+            if resp.get("cell") is not None:
+                base.ci = resp["cell"]
+            if base.radio.upper() == "LTE":
+                base.enb = base.ci // 256
+                base.cid = base.ci % 256
 
     # 2. Cek file cache jika tidak ada di database lokal
-    cpath = cache_path(mcc, mnc, enb, cid)
+    cpath = cache_path(base.mcc, base.mnc, enb_or_cid=base.ci,
+                       cid_or_lac=base.cid, lac=base.lac, radio=base.radio)
     if resp is None and use_cache:
         resp = cache_get(cpath)
         if resp:
@@ -400,7 +472,9 @@ def resolve(mcc: int, mnc: int, enb: int, cid: int,
             base.error = ("Data tidak ditemukan di database lokal dan "
                           "UWL_TOKEN belum diset.")
             return base
-        resp = call_unwiredlabs(tokens, mcc, mnc, enb, cid, exhausted)
+        resp = call_unwiredlabs(tokens=tokens, mcc=base.mcc, mnc=base.mnc,
+                                enb_or_cid=base.ci, lac=base.lac,
+                                radio=base.radio, exhausted=exhausted)
         if resp.get("status") == "ok":
             source = "unwiredlabs"
             if use_cache:
@@ -418,7 +492,10 @@ def resolve(mcc: int, mnc: int, enb: int, cid: int,
     base.accuracy = resp.get("accuracy")
     base.fallback = resp.get("fallback")
     base.plus_code = plus_code(lat, lon)
-    base.azimuth = estimate_azimuth(mcc, mnc, cid)
+    if base.radio.upper() == "LTE" and base.cid is not None:
+        base.azimuth = estimate_azimuth(base.mcc, base.mnc, base.cid)
+    else:
+        base.azimuth = None
 
     if geocode:
         geo = reverse_geocode(lat, lon)
@@ -456,8 +533,16 @@ def print_result(r: Result) -> None:
     print(f"\n--- Hasil{tag} ---")
     print(f"  Negara   : {r.country}")
     print(f"  Operator : {r.operator}")
+    print(f"  Radio    : {r.radio}")
     print(f"  MCC/MNC  : {r.mcc}/{r.mnc:02d}")
-    print(f"  eNB      : {r.enb}  sektor {r.cid}  (CID {r.cid_full})")
+    if r.radio.upper() == "LTE":
+        enb_str = f"eNB {r.enb}  sektor {r.cid}" if r.enb is not None else ""
+        tac_str = f"  TAC {r.lac}" if r.lac is not None else ""
+        print(f"  Cell ID  : {enb_str}  (ECI {r.cid_full}){tac_str}".strip())
+    else:
+        lac_str = f"LAC {r.lac}  " if r.lac is not None else ""
+        print(f"  Cell ID  : {lac_str}CI {r.cid_full}")
+
     if r.source:
         source_label = {
             "local_db": "Database Lokal (OpenCellID)",
@@ -499,11 +584,13 @@ def print_result(r: Result) -> None:
 def main() -> None:
     load_env(Path(__file__).with_name(".env"))
 
-    p = argparse.ArgumentParser(description="LTE cell lookup")
+    p = argparse.ArgumentParser(description="LTE / GSM Cell lookup")
     p.add_argument("--mcc", type=int)
     p.add_argument("--mnc", type=int)
     p.add_argument("--enb", type=int)
     p.add_argument("--cid", type=int)
+    p.add_argument("--lac", type=int, help="Location Area Code / Tracking Area Code")
+    p.add_argument("--ci", type=int, help="Cell ID (2G/3G) atau ECI (4G)")
     p.add_argument("--token", default=os.environ.get("UWL_TOKEN", ""),
                    help="Token UWL (boleh banyak, dipisah koma)")
     p.add_argument("--no-cache", action="store_true")
@@ -519,27 +606,48 @@ def main() -> None:
         print("[config] UWL_TOKEN belum diset (pencarian hanya via database lokal)")
 
     exhausted: set[str] = set()
-    one_shot = all(v is not None
-                   for v in (args.mcc, args.mnc, args.enb, args.cid))
+    one_shot = (
+        (args.enb is not None and args.cid is not None) or
+        (args.ci is not None)
+    )
 
     while True:
         if tokens and len(exhausted) >= len(tokens):
             print("\n! Semua token sudah kena limit.")
+
         mcc = args.mcc if args.mcc is not None else ask_int("MCC", 510)
         mnc = args.mnc if args.mnc is not None else ask_int("MNC", 10)
-        enb = args.enb if args.enb is not None else ask_int("eNB")
-        cid = args.cid if args.cid is not None else ask_int("CID", 1)
 
-        result = resolve(mcc, mnc, enb, cid, tokens, exhausted,
-                         use_cache=not args.no_cache,
-                         use_local_db=not args.no_db)
+        if args.ci is not None or args.lac is not None:
+            lac = args.lac if args.lac is not None else ask_int("LAC/TAC", 0)
+            ci = args.ci if args.ci is not None else ask_int("CI")
+            result = resolve(mcc=mcc, mnc=mnc, lac=lac or None, ci=ci,
+                             tokens=tokens, exhausted=exhausted,
+                             use_cache=not args.no_cache,
+                             use_local_db=not args.no_db)
+        else:
+            enb = args.enb if args.enb is not None else ask_int("eNB (atau 0 untuk LAC/CI)", 0)
+            if enb == 0:
+                lac = ask_int("LAC/TAC")
+                ci = ask_int("CI")
+                result = resolve(mcc=mcc, mnc=mnc, lac=lac, ci=ci,
+                                 tokens=tokens, exhausted=exhausted,
+                                 use_cache=not args.no_cache,
+                                 use_local_db=not args.no_db)
+            else:
+                cid = args.cid if args.cid is not None else ask_int("CID", 1)
+                result = resolve(mcc=mcc, mnc=mnc, enb=enb, cid=cid,
+                                 tokens=tokens, exhausted=exhausted,
+                                 use_cache=not args.no_cache,
+                                 use_local_db=not args.no_db)
+
         print_result(result)
 
         if one_shot:
             break
         if input("\nLagi? (y/N): ").strip().lower() not in ("y", "ya", "yes"):
             break
-        args.mcc = args.mnc = args.enb = args.cid = None
+        args.mcc = args.mnc = args.enb = args.cid = args.lac = args.ci = None
 
 
 if __name__ == "__main__":

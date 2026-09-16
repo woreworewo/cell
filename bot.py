@@ -13,6 +13,7 @@ Konfigurasi via .env (lihat .env.example):
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import logging
 import os
 import re
@@ -120,53 +121,128 @@ def stamp_request(user_id: int) -> None:
     LAST_REQUEST[user_id] = time.time()
 
 
-def parse_args(args: list[str]) -> tuple[int, int, int, int] | None:
-    """Format diterima:
-      /cell 510 10 11071 1
-      /cell 11071 1               (pakai default MCC/MNC dari .env)
-      /cell 510-10-11071-1
-      /cell 510/10/11071/1
-    """
-    if len(args) == 1:
-        for sep in ("-", "/", ",", "_"):
-            if sep in args[0]:
-                args = args[0].split(sep)
-                break
+@dataclass
+class CellQuery:
+    query_type: str  # "enb_cid" atau "lac_ci"
+    mcc: int = DEFAULT_MCC
+    mnc: int = DEFAULT_MNC
+    enb: int | None = None
+    cid: int | None = None   # sektor antena (1-255)
+    lac: int | None = None   # Location Area Code (2G/3G) atau TAC (4G)
+    ci: int | None = None    # Cell ID (2G/3G) atau ECI (4G)
+    radio: str | None = None
 
-    nums = []
-    for a in args:
-        a = a.strip()
-        if not a.lstrip("-").isdigit():
-            return None
-        nums.append(int(a))
 
-    if len(nums) == 4:
-        return nums[0], nums[1], nums[2], nums[3]
-    if len(nums) == 2:
-        return DEFAULT_MCC, DEFAULT_MNC, nums[0], nums[1]
+def _parse_int(token: str) -> int | None:
+    token = token.strip()
+    if not token:
+        return None
+    try:
+        if token.lower().startswith("0x"):
+            return int(token, 16)
+        if any(c in "abcdefABCDEF" for c in token) and all(c in "0123456789abcdefABCDEF" for c in token):
+            return int(token, 16)
+        if token.isdigit():
+            return int(token, 10)
+    except ValueError:
+        return None
     return None
 
 
-def parse_cell_item(s: str) -> tuple[int, int, int, int] | None:
+def parse_cell_item(s: str, force_lac: bool = False) -> CellQuery | None:
     s = s.strip()
     if not s:
         return None
-    for sep in ("-", "/", ",", ":", "_", ";"):
-        s = s.replace(sep, " ")
-    parts = [p for p in s.split() if p.isdigit()]
-    if len(parts) == 4:
-        return int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
-    if len(parts) == 2:
-        return DEFAULT_MCC, DEFAULT_MNC, int(parts[0]), int(parts[1])
+
+    s_lower = s.lower()
+    lac_match = re.search(r"(?:lac|tac)[:=\s]+(0x[0-9a-fA-F]+|[0-9a-fA-F]+)", s_lower)
+    ci_match = re.search(r"(?:ci|cid|eci)[:=\s]+(0x[0-9a-fA-F]+|[0-9a-fA-F]+)", s_lower)
+    enb_match = re.search(r"enb[:=\s]+(0x[0-9a-fA-F]+|[0-9a-fA-F]+)", s_lower)
+    mcc_match = re.search(r"mcc[:=\s]+(\d+)", s_lower)
+    mnc_match = re.search(r"mnc[:=\s]+(\d+)", s_lower)
+
+    mcc = int(mcc_match.group(1)) if mcc_match else DEFAULT_MCC
+    mnc = int(mnc_match.group(1)) if mnc_match else DEFAULT_MNC
+
+    if lac_match and ci_match:
+        lac_val = _parse_int(lac_match.group(1))
+        ci_val = _parse_int(ci_match.group(1))
+        if lac_val is not None and ci_val is not None:
+            return CellQuery(query_type="lac_ci", mcc=mcc, mnc=mnc, lac=lac_val, ci=ci_val)
+
+    if enb_match and ci_match:
+        enb_val = _parse_int(enb_match.group(1))
+        cid_val = _parse_int(ci_match.group(1))
+        if enb_val is not None and cid_val is not None:
+            return CellQuery(query_type="enb_cid", mcc=mcc, mnc=mnc, enb=enb_val, cid=cid_val)
+
+    # Bersihkan pemisah kecuali 0x
+    clean = re.sub(r"[\/\,\:\;\_\-]+", " ", s)
+    tokens = clean.split()
+    nums = [_parse_int(t) for t in tokens if _parse_int(t) is not None]
+
+    if not nums:
+        return None
+
+    if force_lac:
+        if len(nums) == 4:
+            return CellQuery(query_type="lac_ci", mcc=nums[0], mnc=nums[1], lac=nums[2], ci=nums[3])
+        if len(nums) == 2:
+            return CellQuery(query_type="lac_ci", mcc=DEFAULT_MCC, mnc=DEFAULT_MNC, lac=nums[0], ci=nums[1])
+        return None
+
+    # Smart detection:
+    if len(nums) == 1:
+        # Jika hanya 1 angka panjang (> 65535), anggap sebagai ECI LTE
+        if nums[0] > 65535:
+            enb = nums[0] // 256
+            cid = nums[0] % 256
+            return CellQuery(query_type="enb_cid", mcc=DEFAULT_MCC, mnc=DEFAULT_MNC,
+                             enb=enb, cid=cid, ci=nums[0])
+        return None
+
+    if len(nums) == 2:
+        v1, v2 = nums[0], nums[1]
+        # Jika angka kedua > 255, tidak mungkin nomor sektor LTE (1-255).
+        # Jadi pasti merupakan format LAC + CI (atau TAC + ECI).
+        if v2 > 255:
+            return CellQuery(query_type="lac_ci", mcc=DEFAULT_MCC, mnc=DEFAULT_MNC, lac=v1, ci=v2)
+        else:
+            return CellQuery(query_type="enb_cid", mcc=DEFAULT_MCC, mnc=DEFAULT_MNC, enb=v1, cid=v2)
+
+    if len(nums) == 4:
+        v1, v2, v3, v4 = nums[0], nums[1], nums[2], nums[3]
+        if v4 > 255:
+            return CellQuery(query_type="lac_ci", mcc=v1, mnc=v2, lac=v3, ci=v4)
+        else:
+            return CellQuery(query_type="enb_cid", mcc=v1, mnc=v2, enb=v3, cid=v4)
+
     return None
 
 
-def parse_batch_input(raw_text: str) -> list[tuple[int, int, int, int]]:
+def parse_args(args: list[str], force_lac: bool = False) -> CellQuery | None:
+    """Format diterima:
+      /cell 510 10 11071 1
+      /cell 11071 1
+      /cell 18724 49384 (otomatis LAC+CI karena CI > 255)
+      /cell lac 18724 49384
+      /lac 18724 49384
+    """
+    if not args:
+        return None
+    joined = " ".join(args)
+    if joined.lower().startswith("lac "):
+        joined = joined[4:].strip()
+        force_lac = True
+    return parse_cell_item(joined, force_lac=force_lac)
+
+
+def parse_batch_input(raw_text: str) -> list[CellQuery]:
     lines = raw_text.splitlines()
     if lines and lines[0].strip().startswith("/"):
         lines[0] = re.sub(r"^/\w+(@\w+)?", "", lines[0]).strip()
 
-    cells: list[tuple[int, int, int, int]] = []
+    cells: list[CellQuery] = []
     for line in lines:
         line = line.strip()
         if not line:
@@ -177,19 +253,24 @@ def parse_batch_input(raw_text: str) -> list[tuple[int, int, int, int]]:
             if parsed:
                 cells.append(parsed)
             else:
-                tokens = [t for t in item.replace(",", " ").split() if t.isdigit()]
+                tokens = [t for t in re.split(r"[\s,]+", item) if t]
                 idx = 0
                 while idx < len(tokens):
-                    if idx + 4 <= len(tokens) and len(tokens) % 4 == 0:
-                        cells.append((int(tokens[idx]), int(tokens[idx+1]),
-                                      int(tokens[idx+2]), int(tokens[idx+3])))
-                        idx += 4
-                    elif idx + 2 <= len(tokens):
-                        cells.append((DEFAULT_MCC, DEFAULT_MNC,
-                                      int(tokens[idx]), int(tokens[idx+1])))
-                        idx += 2
-                    else:
-                        break
+                    if idx + 4 <= len(tokens):
+                        chunk = " ".join(tokens[idx:idx+4])
+                        p = parse_cell_item(chunk)
+                        if p:
+                            cells.append(p)
+                            idx += 4
+                            continue
+                    if idx + 2 <= len(tokens):
+                        chunk = " ".join(tokens[idx:idx+2])
+                        p = parse_cell_item(chunk)
+                        if p:
+                            cells.append(p)
+                            idx += 2
+                            continue
+                    idx += 1
     return cells
 
 
@@ -273,10 +354,15 @@ def render_nearby(lat: float, lon: float, radius_m: float,
 def render_text(r: Result) -> str:
     lines = [
         f"<b>📡 {r.country} — {r.operator}</b>",
-        f"MCC/MNC: <code>{r.mcc}/{r.mnc:02d}</code>",
-        f"eNB: <code>{r.enb}</code> · sektor <code>{r.cid}</code> "
-        f"(CID <code>{r.cid_full}</code>)",
+        f"Radio: <b>{r.radio}</b> · MCC/MNC: <code>{r.mcc}/{r.mnc:02d}</code>",
     ]
+    if r.radio.upper() == "LTE":
+        enb_str = f"eNB: <code>{r.enb}</code> · sektor <code>{r.cid}</code>" if r.enb is not None else ""
+        tac_str = f" · TAC: <code>{r.lac}</code>" if r.lac is not None else ""
+        lines.append(f"{enb_str} (ECI <code>{r.cid_full}</code>){tac_str}".strip())
+    else:
+        lac_str = f"LAC: <code>{r.lac}</code> · " if r.lac is not None else ""
+        lines.append(f"{lac_str}Cell ID: <code>{r.cid_full}</code>")
 
     if not r.ok:
         lines.append("")
@@ -346,20 +432,20 @@ def build_keyboard(r: Result) -> InlineKeyboardMarkup | None:
 # ---------------------------------------------------------------------------
 HELP_TEXT = (
     "<b>{name}</b>\n\n"
-    "Lookup koordinat sektor LTE dari database lokal & API.\n\n"
+    "Lookup koordinat sektor seluler (4G LTE / 3G / 2G) dari database lokal & API.\n\n"
     "<b>Perintah Utama:</b>\n"
-    "• <code>/cell &lt;enb&gt; &lt;cid&gt;</code> — lookup sektor (default {dmcc}/{dmnc})\n"
-    "• <code>/cell &lt;mcc&gt; &lt;mnc&gt; &lt;enb&gt; &lt;cid&gt;</code> — format lengkap\n"
-    "• <code>/enb &lt;enb&gt;</code> — sweep semua sektor untuk 1 eNB\n"
+    "• <code>/cell &lt;enb&gt; &lt;cid&gt;</code> — lookup sektor 4G LTE\n"
+    "• <code>/lac &lt;lac&gt; &lt;ci&gt;</code> — lookup via LAC dan CI (2G/3G/4G)\n"
+    "• <code>/cell &lt;mcc&gt; &lt;mnc&gt; &lt;enb/lac&gt; &lt;cid/ci&gt;</code> — format lengkap\n"
+    "• <code>/enb &lt;enb&gt;</code> — sweep semua sektor untuk 1 eNB LTE\n"
     "• <code>/batch</code> — lookup banyak cell sekaligus (maks 20)\n"
     "• <code>/nearby [radius]</code> — cari tower terdekat dari lokasi Anda\n\n"
+    "<b>Fitur Pintar:</b>\n"
+    "• Mendukung desimal maupun heksadesimal (0x...).\n"
+    "• Otomatis mendeteksi <code>eNB Sektor</code> vs <code>LAC CI</code> di /cell dan /batch.\n\n"
     "<b>Fitur Lokasi & Antena:</b>\n"
-    "• Share lokasi (📎 → Location) setelah /cell untuk hitung jarak, arah bearing, dan tebakan sektor antena.\n"
+    "• Share lokasi (📎 → Location) setelah /cell untuk hitung jarak, arah bearing, dan estimasi sektor antena.\n"
     "• Share lokasi langsung tanpa /cell untuk melihat semua tower operator di sekitar Anda.\n\n"
-    "<b>Contoh:</b>\n"
-    "<code>/cell 11071 1</code>\n"
-    "<code>/enb 11071</code>\n"
-    "<code>/nearby 1.5km</code>\n\n"
     "Rate limit: 1 request per {rate} per user."
 )
 
@@ -386,8 +472,9 @@ async def cell_cmd(update: Update,
     if parsed is None:
         await msg.reply_text(
             "Format salah. Contoh:\n"
-            f"<code>/cell {DEFAULT_MCC} {DEFAULT_MNC} 11071 1</code>\n"
-            "atau <code>/cell 11071 1</code>",
+            f"• 4G LTE: <code>/cell 11071 1</code>\n"
+            f"• LAC + CI: <code>/cell 18724 49384</code> atau <code>/lac 18724 49384</code>\n"
+            f"• Lengkap: <code>/cell {DEFAULT_MCC} {DEFAULT_MNC} 11071 1</code>",
             parse_mode=ParseMode.HTML)
         return
 
@@ -401,14 +488,23 @@ async def cell_cmd(update: Update,
         await msg.reply_text("⚠️ Bot belum dikonfigurasi (database lokal & UWL_TOKEN tidak tersedia).")
         return
 
-    mcc, mnc, enb, cid = parsed
-    log.info("user=%s lookup mcc=%s mnc=%s enb=%s cid=%s",
-             user.id, mcc, mnc, enb, cid)
+    log.info("user=%s lookup q=%s", user.id, parsed)
     stamp_request(user.id)
 
     # Lookup di thread agar tidak block event loop
     result = await asyncio.to_thread(
-        resolve, mcc, mnc, enb, cid, UWL_TOKENS, EXHAUSTED, True)
+        resolve,
+        mcc=parsed.mcc,
+        mnc=parsed.mnc,
+        enb=parsed.enb,
+        cid=parsed.cid,
+        lac=parsed.lac,
+        ci=parsed.ci,
+        radio=parsed.radio,
+        tokens=UWL_TOKENS,
+        exhausted=EXHAUSTED,
+        use_cache=True,
+    )
 
     text = render_text(result)
     keyboard = build_keyboard(result)
@@ -421,7 +517,65 @@ async def cell_cmd(update: Update,
         await msg.reply_location(latitude=result.lat, longitude=result.lon)
 
     if result.ok:
-        LAST_TOWER[user.id] = (mcc, mnc, enb, cid,
+        LAST_TOWER[user.id] = (result.mcc, result.mnc, result.enb or 0, result.cid or 0,
+                               result.lat, result.lon, time.time())
+
+
+async def lac_cmd(update: Update,
+                  context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Lookup sel berdasarkan LAC dan CI (2G / 3G / 4G)."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+
+    parsed = parse_args(context.args or [], force_lac=True)
+    if parsed is None:
+        await msg.reply_text(
+            "Format salah. Contoh:\n"
+            "• <code>/lac 18724 49384</code>\n"
+            f"• <code>/lac {DEFAULT_MCC} {DEFAULT_MNC} 18724 49384</code>\n"
+            "• Heksadesimal: <code>/lac 0x4924 0xC0E8</code>",
+            parse_mode=ParseMode.HTML)
+        return
+
+    wait = check_rate_limit(user.id)
+    if wait > 0:
+        await msg.reply_text(
+            f"⏳ Tunggu {fmt_secs(wait)} lagi sebelum request berikutnya.")
+        return
+
+    if not UWL_TOKENS and not DB_PATH.exists():
+        await msg.reply_text("⚠️ Bot belum dikonfigurasi (database lokal & UWL_TOKEN tidak tersedia).")
+        return
+
+    log.info("user=%s lac lookup q=%s", user.id, parsed)
+    stamp_request(user.id)
+
+    result = await asyncio.to_thread(
+        resolve,
+        mcc=parsed.mcc,
+        mnc=parsed.mnc,
+        lac=parsed.lac,
+        ci=parsed.ci,
+        radio=parsed.radio,
+        tokens=UWL_TOKENS,
+        exhausted=EXHAUSTED,
+        use_cache=True,
+    )
+
+    text = render_text(result)
+    keyboard = build_keyboard(result)
+    await msg.reply_text(text, parse_mode=ParseMode.HTML,
+                         reply_markup=keyboard,
+                         link_preview_options=LinkPreviewOptions(
+                             is_disabled=True))
+
+    if result.ok and INCLUDE_LOCATION:
+        await msg.reply_location(latitude=result.lat, longitude=result.lon)
+
+    if result.ok:
+        LAST_TOWER[user.id] = (result.mcc, result.mnc, result.enb or 0, result.cid or 0,
                                result.lat, result.lon, time.time())
 
 
@@ -554,15 +708,19 @@ async def batch_cmd(update: Update,
         await msg.reply_text(
             "<b>Format /batch:</b>\n"
             "Kirim daftar cell tower (satu per baris atau dipisah koma).\n\n"
+            "<b>Mendukung Format:</b>\n"
+            "• <code>&lt;enb&gt; &lt;cid&gt;</code> (4G LTE)\n"
+            "• <code>&lt;lac&gt; &lt;ci&gt;</code> (2G/3G/4G, desimal atau heksa 0x...)\n"
+            "• <code>&lt;mcc&gt; &lt;mnc&gt; &lt;enb/lac&gt; &lt;cid/ci&gt;</code> (Lengkap)\n\n"
             "<b>Contoh Multi-line:</b>\n"
             "<code>/batch\n"
             "11071 1\n"
-            "11071 2\n"
-            "41004 1\n"
+            "18724 49384\n"
+            "41004 104990981\n"
             "510 11 43003 4</code>\n\n"
             "<b>Contoh Satu Baris:</b>\n"
-            "<code>/batch 11071:1, 11071:2, 41004:1</code>\n\n"
-            f"<i>Default MCC/MNC: {DEFAULT_MCC}/{DEFAULT_MNC} jika hanya 2 angka (eNB CID). Maks 20 cell.</i>",
+            "<code>/batch 11071:1, 18724:49384, 41004:104990981</code>\n\n"
+            f"<i>Maks 20 cell per request.</i>",
             parse_mode=ParseMode.HTML
         )
         return
@@ -584,9 +742,21 @@ async def batch_cmd(update: Update,
 
     # Resolve tanpa geocoding untuk kecepatan instan
     results: list[Result] = []
-    for mcc, mnc, enb, cid in cells:
+    for q in cells:
         r = await asyncio.to_thread(
-            resolve, mcc, mnc, enb, cid, UWL_TOKENS, EXHAUSTED, True, True, False
+            resolve,
+            mcc=q.mcc,
+            mnc=q.mnc,
+            enb=q.enb,
+            cid=q.cid,
+            lac=q.lac,
+            ci=q.ci,
+            radio=q.radio,
+            tokens=UWL_TOKENS,
+            exhausted=EXHAUSTED,
+            use_cache=True,
+            use_local_db=True,
+            geocode=False,
         )
         results.append(r)
 
@@ -600,16 +770,30 @@ async def batch_cmd(update: Update,
             az_str = f" · 🧭 ~{r.azimuth:.0f}°" if r.azimuth is not None else ""
             src_tag = "📁 db" if r.source == "local_db" else ("⚡ cache" if r.from_cache else "🌐 api")
             acc_str = f" (±{r.accuracy}m)" if r.accuracy is not None else ""
+
+            if r.radio.upper() == "LTE":
+                ident = f"eNB <code>{r.enb}</code> · S<code>{r.cid}</code> (ECI <code>{r.cid_full}</code>)"
+                if r.lac:
+                    ident += f" · TAC: <code>{r.lac}</code>"
+            else:
+                lac_str = f"LAC <code>{r.lac}</code> · " if r.lac else ""
+                ident = f"<b>{r.radio}</b> {lac_str}CI <code>{r.cid_full}</code>"
+
             lines.append(
                 f"<b>{i}. {op_tag}</b> (<code>{r.mcc}/{r.mnc:02d}</code>)\n"
-                f"   eNB <code>{r.enb}</code> · S<code>{r.cid}</code>\n"
+                f"   {ident}\n"
                 f"   📍 <a href=\"https://www.google.com/maps?q={r.lat},{r.lon}\">{r.lat}, {r.lon}</a>{acc_str}{az_str}\n"
                 f"   <i>[{src_tag}]</i>"
             )
         else:
+            if r.radio.upper() == "LTE" and r.enb is not None:
+                ident = f"eNB <code>{r.enb}</code> · S<code>{r.cid}</code>"
+            else:
+                lac_str = f"LAC <code>{r.lac}</code> " if r.lac else ""
+                ident = f"{lac_str}CI <code>{r.cid_full}</code>"
             lines.append(
                 f"<b>{i}. {op_tag}</b> (<code>{r.mcc}/{r.mnc:02d}</code>)\n"
-                f"   eNB <code>{r.enb}</code> · S<code>{r.cid}</code> ❌ {r.error}"
+                f"   {ident} ❌ {r.error}"
             )
         lines.append("")
 
@@ -785,6 +969,7 @@ def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler(["start", "help"], start_cmd))
     app.add_handler(CommandHandler("cell", cell_cmd))
+    app.add_handler(CommandHandler("lac", lac_cmd))
     app.add_handler(CommandHandler("enb", enb_cmd))
     app.add_handler(CommandHandler("batch", batch_cmd))
     app.add_handler(CommandHandler("nearby", nearby_cmd))

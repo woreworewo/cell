@@ -121,6 +121,8 @@ def import_csv_to_sqlite(csv_path: Path = DEFAULT_CSV,
 
     # Index untuk lookup cepat (MCC, MNC, Cell ID)
     cur.execute("CREATE INDEX idx_cells_lookup ON cells (mcc, net, cell)")
+    # Index untuk lookup LAC / TAC + CI
+    cur.execute("CREATE INDEX idx_cells_lac_ci ON cells (area, cell)")
     # Index tambahan untuk lookup LTE/radio
     cur.execute("CREATE INDEX idx_cells_radio ON cells (radio)")
     # Index koordinat untuk radius search
@@ -144,11 +146,14 @@ def ensure_db(force: bool = False) -> bool:
     Jika belum ada dan file 510.csv tersedia, lakukan impor otomatis.
     """
     if DB_PATH.exists() and not force:
-        # Pastikan index koordinat sudah ada
+        # Pastikan index koordinat dan LAC/CI sudah ada
         try:
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_cells_coords ON cells (lat, lon)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_cells_lac_ci ON cells (area, cell)"
                 )
         except Exception:
             pass
@@ -167,6 +172,113 @@ def ensure_db(force: bool = False) -> bool:
         return False
 
 
+def _row_to_cell_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "lat": float(row["lat"]),
+        "lon": float(row["lon"]),
+        "accuracy": int(row["range"]) if row["range"] is not None else None,
+        "radio": row["radio"],
+        "mcc": int(row["mcc"]),
+        "mnc": int(row["net"]),
+        "area": int(row["area"]) if row["area"] is not None else None,
+        "cell": int(row["cell"]),
+        "unit": row["unit"],
+        "source": "local_db",
+    }
+
+
+def query_local_db_lac_ci(mcc: int | None = None,
+                          mnc: int | None = None,
+                          lac: int | None = None,
+                          ci: int | None = None,
+                          radio: str | None = None,
+                          db_path: Path = DB_PATH) -> dict[str, Any] | None:
+    """Cari sel berdasarkan LAC/TAC dan CI dari database lokal SQLite.
+
+    Bisa untuk 2G (GSM), 3G (UMTS), maupun 4G (LTE).
+    Jika MCC/MNC tidak cocok, akan mencoba fallback tanpa batasan MCC/MNC.
+    """
+    if ci is None:
+        return None
+
+    if not db_path.exists():
+        if not ensure_db():
+            return None
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+
+            # 1. Pencarian spesifik jika MCC dan MNC diberikan
+            if mcc is not None and mnc is not None:
+                clauses = ["mcc = ?", "net = ?", "cell = ?"]
+                params: list[Any] = [mcc, mnc, ci]
+                if lac is not None:
+                    clauses.append("area = ?")
+                    params.append(lac)
+                if radio is not None:
+                    clauses.append("radio = ?")
+                    params.append(radio.upper())
+
+                sql = f"""
+                    SELECT radio, mcc, net, area, cell, unit, lon, lat, range, updated
+                    FROM cells
+                    WHERE {" AND ".join(clauses)}
+                    ORDER BY updated DESC
+                    LIMIT 1
+                """
+                cur.execute(sql, params)
+                row = cur.fetchone()
+                if row:
+                    return _row_to_cell_dict(row)
+
+            # 2. Fallback cross-operator jika LAC diberikan
+            if lac is not None:
+                clauses = ["area = ?", "cell = ?"]
+                params = [lac, ci]
+                if radio is not None:
+                    clauses.append("radio = ?")
+                    params.append(radio.upper())
+
+                sql = f"""
+                    SELECT radio, mcc, net, area, cell, unit, lon, lat, range, updated
+                    FROM cells
+                    WHERE {" AND ".join(clauses)}
+                    ORDER BY updated DESC
+                    LIMIT 1
+                """
+                cur.execute(sql, params)
+                row = cur.fetchone()
+                if row:
+                    return _row_to_cell_dict(row)
+
+            # 3. Pencarian hanya berdasarkan cell ID (misal ECI unik)
+            clauses = ["cell = ?"]
+            params = [ci]
+            if radio is not None:
+                clauses.append("radio = ?")
+                params.append(radio.upper())
+
+            sql = f"""
+                SELECT radio, mcc, net, area, cell, unit, lon, lat, range, updated
+                FROM cells
+                WHERE {" AND ".join(clauses)}
+                ORDER BY updated DESC
+                LIMIT 1
+            """
+            cur.execute(sql, params)
+            row = cur.fetchone()
+            if row:
+                return _row_to_cell_dict(row)
+
+            return None
+    except Exception as e:
+        log.warning("Gagal query LAC/CI database lokal: %s", e)
+        return None
+
+
 def query_local_db(mcc: int, mnc: int, enb: int, cid: int,
                    db_path: Path = DB_PATH) -> dict[str, Any] | None:
     """Cari koordinat sektor LTE dari database lokal SQLite.
@@ -174,43 +286,9 @@ def query_local_db(mcc: int, mnc: int, enb: int, cid: int,
     Dalam LTE:
       cell (ECI) = enb * 256 + cid
     """
-    if not db_path.exists():
-        if not ensure_db():
-            return None
-
     eci = enb * 256 + cid
-    try:
-        with sqlite3.connect(db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            # Prioritaskan baris dengan timestamp updated terbaru
-            cur.execute(
-                """
-                SELECT lat, lon, range, radio, area, unit, updated
-                FROM cells
-                WHERE mcc = ? AND net = ? AND cell = ?
-                ORDER BY updated DESC
-                LIMIT 1
-                """,
-                (mcc, mnc, eci),
-            )
-            row = cur.fetchone()
-            if not row:
-                return None
-
-            return {
-                "status": "ok",
-                "lat": float(row["lat"]),
-                "lon": float(row["lon"]),
-                "accuracy": int(row["range"]) if row["range"] is not None else None,
-                "radio": row["radio"],
-                "area": row["area"],
-                "unit": row["unit"],
-                "source": "local_db",
-            }
-    except Exception as e:
-        log.warning("Gagal query database lokal: %s", e)
-        return None
+    return query_local_db_lac_ci(mcc=mcc, mnc=mnc, lac=None, ci=eci,
+                                 radio="LTE", db_path=db_path)
 
 
 def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:

@@ -112,13 +112,21 @@ dengan rate limit per user (default 5 menit).
 
 Di chat dengan bot:
 
-- `/cell 510 10 11071 1` - format lengkap
-- `/cell 11071 1` - pakai default MCC/MNC dari `.env`
-- `/cell 510-10-11071-1` - separator alternatif (`-`, `/`, `,`, `_`)
-- `/enb 11071` - sweep semua sektor sekaligus, list azimuth tiap sektor
-- `/batch` - lookup banyak cell sekaligus (maks 20 cell, multi-line atau dipisah koma)
+- `/cell 11071 1` - lookup 4G LTE via eNB & Sektor (default MCC/MNC dari `.env`)
+- `/cell 510 10 11071 1` - format 4G LTE lengkap
+- `/lac 18724 49384` - lookup via **LAC & CI** (2G / 3G / 4G)
+- `/cell 18724 49384` - otomatis dideteksi sebagai LAC+CI karena CI > 255
+- `/cell 0x4924 0xC0E8` - mendukung format heksadesimal dari modem / AT Command
+- `/enb 11071` - sweep semua sektor sekaligus untuk 1 eNB LTE, list azimuth tiap sektor
+- `/batch` - lookup banyak cell sekaligus (maks 20 cell, bisa kombinasi eNB+CID maupun LAC+CI)
 - `/nearby [radius]` - cari semua tower di sekitar koordinat/lokasi Anda
 - `/start` atau `/help` - bantuan
+
+**Fitur Pintar Deteksi Format:**
+- Input 2 angka kecil (`11071 1`): Dikenali sebagai `eNB Sektor` (4G LTE).
+- Input 2 angka besar (`18724 49384` atau `41004 104990981`): Otomatis dikenali sebagai `LAC CI` atau `TAC ECI`.
+- Input heksadesimal (`0x...` atau `4924 C0E8`): Otomatis dikonversi ke desimal.
+- Input kata kunci: `lac:18724 ci:49384` atau `tac:41004 eci:104990981`.
 
 **Fitur Lokasi & Antena:**
 - Setelah `/cell` atau `/enb` sukses, share lokasi kamu lewat klip 📎 → Location. Bot akan balas dengan jarak ke tower, bearing arah tower, dan tebakan sektor mana yang seharusnya melayani posisi kamu.
