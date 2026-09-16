@@ -171,13 +171,18 @@ Aplikasi dilengkapi dukungan database lokal berbasis SQLite (`data/cells.db`) ya
 2. **Cache File** (`cache/*.json`): Mengambil hasil query sebelumnya jika ada.
 3. **Unwired Labs API**: Fallback ke online API jika tower belum ada di database lokal.
 
-### Impor Manual:
-Database otomatis dibuat saat bot atau CLI pertama kali dijalankan. Jika ingin mengimpor manual:
+### Impor Manual (Indonesia atau Seluruh Dunia):
+Database otomatis dibuat saat bot atau CLI pertama kali dijalankan. Anda juga dapat mengimpor data manual atau memperbarui dengan dump CSV terbaru (misal `cell_towers_*.csv`):
 
 ```cmd
+# 1. Impor data seluruh dunia (OpenCellID Worldwide Dump):
+python import_csv.py data/cell_towers_2026-09-16-T000000.csv
+
+# 2. Impor HANYA Indonesia (MCC 510) dari dump seluruh dunia:
+python import_csv.py data/cell_towers_2026-09-16-T000000.csv --mcc 510
+
+# 3. Impor data default (data/510.csv):
 python import_csv.py
-# atau dengan path custom
-python import_csv.py data/510.csv
 ```
 
 ## Rumus CID

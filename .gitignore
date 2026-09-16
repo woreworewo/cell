@@ -6,3 +6,5 @@ cache/
 *.tmp
 data/*.db
 data/*.tmp
+data/cell_towers_*.csv
+*.csv.gz

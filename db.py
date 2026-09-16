@@ -32,8 +32,18 @@ def get_db_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
 
 
 def import_csv_to_sqlite(csv_path: Path = DEFAULT_CSV,
-                         db_path: Path = DB_PATH) -> int:
-    """Import file CSV (OpenCellID format) ke database SQLite."""
+                         db_path: Path = DB_PATH,
+                         mcc_filter: int | list[int] | set[int] | None = None,
+                         batch_size: int = 50000) -> int:
+    """Import file CSV (OpenCellID format) ke database SQLite.
+
+    Args:
+        csv_path: Lokasi file CSV sumber.
+        db_path: Lokasi file database target.
+        mcc_filter: Jika diisi (misal 510), hanya mengimpor sel dengan MCC ini.
+                    Jika None, mengimpor seluruh dunia.
+        batch_size: Jumlah baris per batch commit (default 50.000).
+    """
     if not csv_path.exists():
         raise FileNotFoundError(f"File CSV tidak ditemukan: {csv_path}")
 
@@ -42,13 +52,16 @@ def import_csv_to_sqlite(csv_path: Path = DEFAULT_CSV,
     if temp_db.exists():
         temp_db.unlink()
 
-    log.info("Memulai impor %s -> %s...", csv_path.name, db_path.name)
+    filter_desc = f" (Filter MCC: {mcc_filter})" if mcc_filter else " (Seluruh Dunia)"
+    log.info("Memulai impor %s -> %s%s...", csv_path.name, db_path.name, filter_desc)
     t0 = time.time()
 
     conn = sqlite3.connect(temp_db)
     cur = conn.cursor()
     cur.execute("PRAGMA synchronous = OFF")
-    cur.execute("PRAGMA journal_mode = MEMORY")
+    cur.execute("PRAGMA journal_mode = OFF")
+    cur.execute("PRAGMA cache_size = -128000")  # 128 MB RAM cache
+    cur.execute("PRAGMA temp_store = MEMORY")
 
     cur.execute("""
     CREATE TABLE cells (
@@ -69,12 +82,22 @@ def import_csv_to_sqlite(csv_path: Path = DEFAULT_CSV,
     )
     """)
 
+    mcc_set: set[int] | None = None
+    if mcc_filter is not None:
+        if isinstance(mcc_filter, int):
+            mcc_set = {mcc_filter}
+        else:
+            mcc_set = set(mcc_filter)
+
     batch: list[tuple[Any, ...]] = []
     count = 0
+    total_read = 0
+    last_log_time = t0
 
     with open(csv_path, mode="r", encoding="utf-8", errors="replace") as f:
         reader = csv.reader(f)
         for row in reader:
+            total_read += 1
             if not row or len(row) < 9:
                 continue
             # Lewati jika baris pertama adalah header
@@ -82,8 +105,11 @@ def import_csv_to_sqlite(csv_path: Path = DEFAULT_CSV,
                 continue
 
             try:
-                radio = row[0].strip().upper()
                 mcc = int(row[1])
+                if mcc_set is not None and mcc not in mcc_set:
+                    continue
+
+                radio = row[0].strip().upper()
                 net = int(row[2])
                 area = int(row[3]) if row[3] else None
                 cell = int(row[4])
@@ -103,12 +129,22 @@ def import_csv_to_sqlite(csv_path: Path = DEFAULT_CSV,
                 ))
                 count += 1
 
-                if len(batch) >= 10000:
+                if len(batch) >= batch_size:
                     cur.executemany(
                         "INSERT INTO cells VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         batch
                     )
                     batch.clear()
+
+                    now = time.time()
+                    if now - last_log_time >= 5.0:
+                        elapsed = now - t0
+                        rate = count / elapsed if elapsed > 0 else 0
+                        log.info(
+                            "Progress: %d baris tersimpan (dibaca: %d baris, %.0f baris/detik)...",
+                            count, total_read, rate
+                        )
+                        last_log_time = now
             except (ValueError, IndexError):
                 continue
 
@@ -118,6 +154,10 @@ def import_csv_to_sqlite(csv_path: Path = DEFAULT_CSV,
                 batch
             )
             batch.clear()
+
+    t_insert = time.time()
+    log.info("Selesai membaca data (%d tersimpan dari %d dibaca dalam %.1f detik). Membuat index...",
+             count, total_read, t_insert - t0)
 
     # Index untuk lookup cepat (MCC, MNC, Cell ID)
     cur.execute("CREATE INDEX idx_cells_lookup ON cells (mcc, net, cell)")
@@ -143,7 +183,7 @@ def import_csv_to_sqlite(csv_path: Path = DEFAULT_CSV,
 def ensure_db(force: bool = False) -> bool:
     """Pastikan database cells.db ada dan siap digunakan.
 
-    Jika belum ada dan file 510.csv tersedia, lakukan impor otomatis.
+    Jika belum ada dan file CSV tersedia, lakukan impor otomatis.
     """
     if DB_PATH.exists() and not force:
         # Pastikan index koordinat dan LAC/CI sudah ada
@@ -159,13 +199,20 @@ def ensure_db(force: bool = False) -> bool:
             pass
         return True
 
-    if not DEFAULT_CSV.exists():
-        log.warning("Database %s belum ada dan CSV %s tidak ditemukan.",
-                    DB_PATH.name, DEFAULT_CSV.name)
+    csv_to_use = DEFAULT_CSV
+    if not csv_to_use.exists():
+        import glob
+        dumps = sorted(glob.glob(str(DATA_DIR / "cell_towers_*.csv")), reverse=True)
+        if dumps:
+            csv_to_use = Path(dumps[0])
+
+    if not csv_to_use.exists():
+        log.warning("Database %s belum ada dan CSV tidak ditemukan.",
+                    DB_PATH.name)
         return False
 
     try:
-        import_csv_to_sqlite(DEFAULT_CSV, DB_PATH)
+        import_csv_to_sqlite(csv_to_use, DB_PATH)
         return True
     except Exception as e:
         log.error("Gagal melakukan auto-init database: %s", e)
