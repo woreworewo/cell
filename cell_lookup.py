@@ -29,6 +29,8 @@ from typing import Any
 
 import requests
 
+from db import ensure_db, query_local_db
+
 UWL_API = "https://ap1.unwiredlabs.com/v2/process.php"
 NOMINATIM_API = "https://nominatim.openstreetmap.org/reverse"
 USER_AGENT = "cell-lookup-cli/1.2"
@@ -351,6 +353,7 @@ class Result:
     address_components: dict = field(default_factory=dict)
     display_name: str = ""
     from_cache: bool = False
+    source: str = ""  # "local_db", "cache", "unwiredlabs"
     error: str = ""
 
     @property
@@ -363,29 +366,49 @@ class Result:
 
 
 def resolve(mcc: int, mnc: int, enb: int, cid: int,
-            tokens: list[str], exhausted: set[str] | None = None,
-            use_cache: bool = True) -> Result:
+            tokens: list[str] | None = None,
+            exhausted: set[str] | None = None,
+            use_cache: bool = True,
+            use_local_db: bool = True) -> Result:
     """One-shot lookup; returns Result."""
+    tokens = tokens or []
     exhausted = exhausted if exhausted is not None else set()
     country, operator = operator_info(mcc, mnc)
     base = Result(ok=False, mcc=mcc, mnc=mnc, enb=enb, cid=cid,
                   country=country, operator=operator)
 
-    cpath = cache_path(mcc, mnc, enb, cid)
-    resp: dict[str, Any] | None = cache_get(cpath) if use_cache else None
-    from_cache = resp is not None
+    resp: dict[str, Any] | None = None
+    source = ""
 
+    # 1. Cek database lokal SQLite (OpenCellID)
+    if use_local_db:
+        resp = query_local_db(mcc, mnc, enb, cid)
+        if resp:
+            source = "local_db"
+
+    # 2. Cek file cache jika tidak ada di database lokal
+    cpath = cache_path(mcc, mnc, enb, cid)
+    if resp is None and use_cache:
+        resp = cache_get(cpath)
+        if resp:
+            source = "cache"
+
+    # 3. Fallback ke Unwired Labs API jika belum ditemukan
     if resp is None:
         if not tokens:
-            base.error = "UWL_TOKEN belum diset."
+            base.error = ("Data tidak ditemukan di database lokal dan "
+                          "UWL_TOKEN belum diset.")
             return base
         resp = call_unwiredlabs(tokens, mcc, mnc, enb, cid, exhausted)
-        if resp.get("status") == "ok" and use_cache:
-            cache_put(cpath, resp)
+        if resp.get("status") == "ok":
+            source = "unwiredlabs"
+            if use_cache:
+                cache_put(cpath, resp)
 
-    base.from_cache = from_cache
-    if resp.get("status") != "ok":
-        base.error = resp.get("message") or "Database tidak ditemukan."
+    base.from_cache = (source == "cache")
+    base.source = source
+    if not resp or resp.get("status") != "ok":
+        base.error = (resp.get("message") if resp else None) or "Database tidak ditemukan."
         return base
 
     lat, lon = float(resp["lat"]), float(resp["lon"])
@@ -417,12 +440,26 @@ def ask_int(label: str, default: int | None = None) -> int:
 
 
 def print_result(r: Result) -> None:
-    tag = " (cache)" if r.from_cache else ""
+    tag = ""
+    if r.source == "local_db":
+        tag = " (db lokal)"
+    elif r.from_cache or r.source == "cache":
+        tag = " (cache)"
+    elif r.source == "unwiredlabs":
+        tag = " (online API)"
+
     print(f"\n--- Hasil{tag} ---")
     print(f"  Negara   : {r.country}")
     print(f"  Operator : {r.operator}")
     print(f"  MCC/MNC  : {r.mcc}/{r.mnc:02d}")
     print(f"  eNB      : {r.enb}  sektor {r.cid}  (CID {r.cid_full})")
+    if r.source:
+        source_label = {
+            "local_db": "Database Lokal (OpenCellID)",
+            "cache": "Cache Lokal",
+            "unwiredlabs": "Unwired Labs API",
+        }.get(r.source, r.source)
+        print(f"  Sumber   : {source_label}")
 
     if not r.ok:
         print(f"  Status   : error")
@@ -465,28 +502,32 @@ def main() -> None:
     p.add_argument("--token", default=os.environ.get("UWL_TOKEN", ""),
                    help="Token UWL (boleh banyak, dipisah koma)")
     p.add_argument("--no-cache", action="store_true")
+    p.add_argument("--no-db", action="store_true", help="Bypass database lokal SQLite")
     args = p.parse_args()
 
+    ensure_db()
+
     tokens = parse_tokens(args.token)
-    if not tokens:
-        sys.exit("ERROR: UWL_TOKEN belum diset (.env / env / --token).")
-    print(f"[config] {len(tokens)} token siap dipakai")
+    if tokens:
+        print(f"[config] {len(tokens)} token UWL siap dipakai")
+    else:
+        print("[config] UWL_TOKEN belum diset (pencarian hanya via database lokal)")
 
     exhausted: set[str] = set()
     one_shot = all(v is not None
                    for v in (args.mcc, args.mnc, args.enb, args.cid))
 
     while True:
-        if len(exhausted) >= len(tokens):
-            print("\n! Semua token sudah kena limit. Berhenti.")
-            break
+        if tokens and len(exhausted) >= len(tokens):
+            print("\n! Semua token sudah kena limit.")
         mcc = args.mcc if args.mcc is not None else ask_int("MCC", 510)
         mnc = args.mnc if args.mnc is not None else ask_int("MNC", 10)
         enb = args.enb if args.enb is not None else ask_int("eNB")
         cid = args.cid if args.cid is not None else ask_int("CID", 1)
 
         result = resolve(mcc, mnc, enb, cid, tokens, exhausted,
-                         use_cache=not args.no_cache)
+                         use_cache=not args.no_cache,
+                         use_local_db=not args.no_db)
         print_result(result)
 
         if one_shot:

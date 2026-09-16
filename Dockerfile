@@ -12,10 +12,10 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 # App source
-COPY cell_lookup.py bot.py ./
+COPY cell_lookup.py bot.py db.py import_csv.py ./
 
-# Cache directory (mounted as volume in compose)
-RUN mkdir -p /app/cache
+# Cache and data directory (mounted as volume in compose)
+RUN mkdir -p /app/cache /app/data
 
 # Run as non-root
 RUN useradd --system --uid 1000 --home /app appuser \

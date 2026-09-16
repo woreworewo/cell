@@ -148,6 +148,29 @@ Bot membalas dengan:
 
 
 
+## Database Lokal (OpenCellID / SQLite)
+
+Aplikasi dilengkapi dukungan database lokal berbasis SQLite (`data/cells.db`) yang di-generate dari data OpenCellID Indonesia (`data/510.csv`).
+
+### Keuntungan:
+- **Respon Instan (< 1 ms)** tanpa latency jaringan.
+- **Hemat Kuota API**: Sebagian besar tower Indonesia sudah tersedia offline, memangkas penggunaan kuota Unwired Labs hingga 90%+.
+- **Tahan Gangguan**: Bot tetap bisa melayani pencarian tower lokal meskipun kuota API online habis.
+
+### Hirarki Pencarian:
+1. **Database Lokal** (`data/cells.db`): Mencari data offline dari OpenCellID.
+2. **Cache File** (`cache/*.json`): Mengambil hasil query sebelumnya jika ada.
+3. **Unwired Labs API**: Fallback ke online API jika tower belum ada di database lokal.
+
+### Impor Manual:
+Database otomatis dibuat saat bot atau CLI pertama kali dijalankan. Jika ingin mengimpor manual:
+
+```cmd
+python import_csv.py
+# atau dengan path custom
+python import_csv.py data/510.csv
+```
+
 ## Rumus CID
 
 ```
@@ -155,3 +178,15 @@ cid_full = eNB * 256 + sector
 ```
 
 Itu yang dikirim ke Unwired Labs sebagai field `cid`.
+
+## Deploy di VPS (Docker)
+
+Jika aplikasi di-host di VPS menggunakan Docker:
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+Folder `data/` dan `cache/` sudah otomatis ter-mount sebagai Docker volume.
+

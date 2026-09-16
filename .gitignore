@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 cache/
+*.db
+*.tmp
+data/*.db
+data/*.tmp

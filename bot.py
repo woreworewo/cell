@@ -28,6 +28,7 @@ from cell_lookup import (Result, bearing_deg, best_serving_sector,
                          compass_label, estimate_azimuth, haversine_m,
                          load_env, map_links, parse_tokens, resolve,
                          sector_azimuths)
+from db import DB_PATH, ensure_db
 
 # ---------------------------------------------------------------------------
 # Config
@@ -183,9 +184,15 @@ def render_text(r: Result) -> str:
             lines.append("")
             lines.append(f"🏠 {r.display_name}")
 
-    if r.from_cache:
+    if r.source == "local_db":
         lines.append("")
-        lines.append("<i>(dari cache)</i>")
+        lines.append("<i>📁 Sumber: Database Lokal (OpenCellID)</i>")
+    elif r.from_cache or r.source == "cache":
+        lines.append("")
+        lines.append("<i>⚡ Sumber: Cache Lokal</i>")
+    elif r.source == "unwiredlabs":
+        lines.append("")
+        lines.append("<i>🌐 Sumber: Unwired Labs API</i>")
 
     return "\n".join(lines)
 
@@ -259,13 +266,8 @@ async def cell_cmd(update: Update,
             f"⏳ Tunggu {fmt_secs(wait)} lagi sebelum request berikutnya.")
         return
 
-    if not UWL_TOKENS:
-        await msg.reply_text("⚠️ Bot belum dikonfigurasi (UWL_TOKEN kosong).")
-        return
-
-    if len(EXHAUSTED) >= len(UWL_TOKENS):
-        await msg.reply_text(
-            "⚠️ Semua token UWL sudah kena limit hari ini. Coba besok.")
+    if not UWL_TOKENS and not DB_PATH.exists():
+        await msg.reply_text("⚠️ Bot belum dikonfigurasi (database lokal & UWL_TOKEN tidak tersedia).")
         return
 
     mcc, mnc, enb, cid = parsed
@@ -349,13 +351,8 @@ async def enb_cmd(update: Update,
             f"⏳ Tunggu {fmt_secs(wait)} lagi sebelum request berikutnya.")
         return
 
-    if not UWL_TOKENS:
-        await msg.reply_text("⚠️ Bot belum dikonfigurasi (UWL_TOKEN kosong).")
-        return
-
-    if len(EXHAUSTED) >= len(UWL_TOKENS):
-        await msg.reply_text(
-            "⚠️ Semua token UWL sudah kena limit hari ini. Coba besok.")
+    if not UWL_TOKENS and not DB_PATH.exists():
+        await msg.reply_text("⚠️ Bot belum dikonfigurasi (database lokal & UWL_TOKEN tidak tersedia).")
         return
 
     log.info("user=%s sweep mcc=%s mnc=%s enb=%s count=%s",
@@ -364,8 +361,6 @@ async def enb_cmd(update: Update,
 
     results: list[Result] = []
     for sector in range(1, count + 1):
-        if len(EXHAUSTED) >= len(UWL_TOKENS):
-            break
         r = await asyncio.to_thread(
             resolve, mcc, mnc, enb, sector, UWL_TOKENS, EXHAUSTED, True)
         results.append(r)
@@ -388,7 +383,14 @@ async def enb_cmd(update: Update,
         if r.ok:
             az = (f"~{r.azimuth:.0f}° ({r.azimuth_label})"
                   if r.azimuth is not None else "?")
-            tag = " <i>(cache)</i>" if r.from_cache else ""
+            if r.source == "local_db":
+                tag = " <i>(db lokal)</i>"
+            elif r.from_cache or r.source == "cache":
+                tag = " <i>(cache)</i>"
+            elif r.source == "unwiredlabs":
+                tag = " <i>(online API)</i>"
+            else:
+                tag = ""
             lines.append(f"  • S{r.cid} → {az}{tag}")
         else:
             lines.append(f"  • S{r.cid} → ❌ {r.error}")
@@ -473,6 +475,9 @@ def main() -> None:
     log.info("Starting bot '%s' (rate limit: %s, default MCC/MNC: %s/%s, "
              "tokens: %d)", BOT_NAME, fmt_secs(RATE_LIMIT),
              DEFAULT_MCC, DEFAULT_MNC, len(UWL_TOKENS))
+
+    # Pastikan database lokal siap
+    ensure_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler(["start", "help"], start_cmd))

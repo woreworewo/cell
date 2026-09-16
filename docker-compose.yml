@@ -7,6 +7,7 @@ services:
     env_file: .env
     volumes:
       - ./cache:/app/cache
+      - ./data:/app/data
     # Bot pakai polling, tidak buka port. Logging ke stdout (lihat dengan
     # `docker compose logs -f`).
     logging:
