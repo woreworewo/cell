@@ -227,12 +227,40 @@ Exit code 0 kalau sukses, 1 kalau gagal — aman dipakai untuk alerting.
 
 Export OpenCellID baru tersedia tiap hari **pukul 02:00 GMT** (09:00 WIB),
 dan tiap file hanya boleh diunduh **2x per hari**. Jadwalkan sekitar
-pukul 10:00 WIB supaya file sudah pasti tersedia:
+pukul 10:00 WIB supaya file sudah pasti tersedia.
+
+**Pakai timezone server, bukan asumsi WIB.** Jadwal cron mengikuti jam
+server. Cek dulu dengan `timedatectl`. Contoh konversi 10:00 WIB:
+
+| Timezone server | Yang ditulis di crontab |
+|---|---|
+| WIB (UTC+7) | `0 10 * * *` |
+| CST / Asia/Shanghai (UTC+8) | `0 11 * * *` |
+| UTC | `0 3 * * *` |
+
+Menulis `0 10` di server CST berarti job terpicu pukul 10:00 CST = 09:00
+WIB — persis saat file terbit, tanpa margin. Kalau unduhan berjalan lebih
+cepat dari jadwal server, `update_db.py` menerima respons "belum tersedia"
+dan keluar dengan exit code 1.
+
+Pasang di crontab user pemilik deploy (tanpa `sudo`), bukan root:
 
 ```cron
-# Update database cell tower tiap hari, 10:00 WIB (03:00 GMT)
-0 10 * * * cd /path/deploy && /usr/bin/docker compose run --rm bot python update_db.py >> data/update.log 2>&1
+# Update database cell tower tiap hari, 11:00 CST = 10:00 WIB (03:00 GMT)
+0 11 * * * cd /home/ubuntu/cell && /usr/bin/docker compose run --rm bot python update_db.py >> /home/ubuntu/cell/data/update.log 2>&1
 ```
+
+Dua detail yang bikin cron gagal padahal di shell lancar:
+
+- **PATH cron hanya `/usr/bin:/bin`.** Pakai path absolut (`/usr/bin/docker`).
+  Kalau `which docker` menunjukkan `/usr/local/bin/docker`, ganti jadi itu.
+- **Redirect pakai path absolut.** Pada `cd X && cmd >> log`, redirect baru
+  aktif setelah `cd` sukses — kalau path salah, pesan errornya hilang ke
+  mail lokal yang biasanya tidak ada MTA-nya, dan `update.log` tidak
+  bertambah sama sekali.
+
+Environment container sama dengan saat dijalankan manual, jadi `OCID_TOKEN`
+dari `.env` tetap terbaca (via `env_file` di `docker-compose.yml`).
 
 Bot **tidak perlu** dihentikan. Impor menulis ke file terpisah lalu
 me-`rename`-nya, jadi bot yang sedang jalan tetap membaca DB lama sampai
@@ -240,12 +268,19 @@ selesai — tidak ada query yang putus di tengah.
 
 Konsekuensinya, `VACUUM` bisa dilewati kalau bot sedang memegang koneksi
 ke DB (VACUUM butuh akses eksklusif). Itu tidak masalah: data tetap
-terimpor, hanya file-nya sedikit lebih besar. Untuk memastikan VACUUM
-jalan, hentikan bot dulu:
+terimpor, hanya file-nya sedikit lebih besar.
+
+Dalam praktiknya ini jarang terjadi: `db.py` membuka koneksi SQLite per
+query lalu menutupnya, dan `ensure_db()` di startup juga menutup
+koneksinya. Jadi bot tidak menyimpan koneksi lama yang menahan VACUUM.
+Kalau ternyata VACUUM tetap dilewati (lihat log), hentikan bot dulu:
 
 ```cron
-0 10 * * * cd /path/deploy && docker compose stop bot && docker compose run --rm bot python update_db.py >> data/update.log 2>&1; docker compose start bot
+0 11 * * * cd /home/ubuntu/cell && docker compose stop bot && docker compose run --rm bot python update_db.py >> /home/ubuntu/cell/data/update.log 2>&1; docker compose start bot
 ```
+
+Perhatikan `;` sebelum `docker compose start bot`: bot dinyalakan kembali
+apa pun hasil updatenya, supaya bot tidak tinggal mati kalau update gagal.
 
 **Catatan penting:**
 
