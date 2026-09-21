@@ -12,7 +12,7 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 # App source
-COPY cell_lookup.py bot.py db.py import_csv.py ./
+COPY cell_lookup.py bot.py db.py import_csv.py update_db.py ./
 
 # Cache and data directory (mounted as volume in compose)
 RUN mkdir -p /app/cache /app/data

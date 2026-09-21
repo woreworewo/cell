@@ -204,3 +204,60 @@ docker compose up -d --build
 
 Folder `data/` dan `cache/` sudah otomatis ter-mount sebagai Docker volume.
 
+### Update Database Otomatis Harian
+
+`update_db.py` mengunduh file negara terbaru dari OpenCellID, mengekstraknya,
+mengimpor ulang ke SQLite, lalu menjalankan `VACUUM` + `ANALYZE`. Hanya
+memakai pustaka standar, jadi tidak menambah dependency.
+
+```bash
+# Unduh + impor Indonesia (MCC 510), token dari OCID_TOKEN di .env
+docker compose run --rm bot python update_db.py
+
+# Negara lain
+docker compose run --rm bot python update_db.py --mcc 502
+
+# Tanpa unduh — impor ulang CSV yang sudah ada
+docker compose run --rm bot python update_db.py --csv data/510.csv
+```
+
+Exit code 0 kalau sukses, 1 kalau gagal — aman dipakai untuk alerting.
+
+#### Jadwalkan lewat cron
+
+Export OpenCellID baru tersedia tiap hari **pukul 02:00 GMT** (09:00 WIB),
+dan tiap file hanya boleh diunduh **2x per hari**. Jadwalkan sekitar
+pukul 10:00 WIB supaya file sudah pasti tersedia:
+
+```cron
+# Update database cell tower tiap hari, 10:00 WIB (03:00 GMT)
+0 10 * * * cd /path/deploy && /usr/bin/docker compose run --rm bot python update_db.py >> data/update.log 2>&1
+```
+
+Bot **tidak perlu** dihentikan. Impor menulis ke file terpisah lalu
+me-`rename`-nya, jadi bot yang sedang jalan tetap membaca DB lama sampai
+selesai — tidak ada query yang putus di tengah.
+
+Konsekuensinya, `VACUUM` bisa dilewati kalau bot sedang memegang koneksi
+ke DB (VACUUM butuh akses eksklusif). Itu tidak masalah: data tetap
+terimpor, hanya file-nya sedikit lebih besar. Untuk memastikan VACUUM
+jalan, hentikan bot dulu:
+
+```cron
+0 10 * * * cd /path/deploy && docker compose stop bot && docker compose run --rm bot python update_db.py >> data/update.log 2>&1; docker compose start bot
+```
+
+**Catatan penting:**
+
+- Impor bersifat **atomic** (tulis ke `cells.tmp`, baru di-`replace`), jadi
+  kalau cron mati di tengah jalan `cells.db` lama tetap utuh. Konsekuensinya
+  butuh ruang disk sekitar 2x ukuran DB akhir selama proses.
+- `VACUUM` butuh ruang disk sebesar ukuran DB (SQLite menulis ulang file utuh).
+  Pastikan `df -h` masih lega, terutama kalau pakai dump seluruh dunia.
+- Secara default backup **tidak** dibuat tiap hari — menyalin DB multi-GB
+  setiap hari membuang disk. Jalankan `--backup` sekali sebelum perubahan
+  besar, atau andalkan sifat atomic di atas.
+- Token OpenCellID sama dengan token Unwired Labs (format `pk.`). Kalau
+  `OCID_TOKEN` kosong, script memakai token pertama di `UWL_TOKEN`.
+
+
