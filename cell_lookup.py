@@ -32,10 +32,12 @@ import requests
 from db import ensure_db, query_local_db, query_local_db_lac_ci
 
 UWL_API = "https://ap1.unwiredlabs.com/v2/process.php"
+OCID_API = "https://opencellid.org/cell/get"
 NOMINATIM_API = "https://nominatim.openstreetmap.org/reverse"
 USER_AGENT = "cell-lookup-cli/1.2"
 CACHE_DIR = Path(__file__).with_name("cache")
 CACHE_TTL = 30 * 24 * 3600  # 30 hari
+OCID_TIMEOUT = 20  # detik
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +230,14 @@ def parse_tokens(raw: str) -> list[str]:
     return out
 
 
+def _env_flag(key: str, default: bool) -> bool:
+    """Baca toggle boolean dari environment (1/true/yes/on)."""
+    raw = os.environ.get(key, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "y", "on")
+
+
 def map_links(lat: float, lon: float) -> list[tuple[str, str]]:
     return [
         ("Google", f"https://www.google.com/maps?q={lat},{lon}"),
@@ -344,6 +354,107 @@ def call_unwiredlabs(tokens: list[str], mcc: int, mnc: int,
     return last
 
 
+def _normalize_ocid(resp: dict, mcc: int, mnc: int,
+                    lac: int | None, ci: int,
+                    radio: str | None) -> dict:
+    """Samakan bentuk respons OpenCellID dengan respons internal lain.
+
+    OpenCellID memakai `range` untuk perkiraan jangkauan (meter), setara
+    `accuracy` di Unwired Labs dan kolom `range` di database lokal.
+    """
+    rng = resp.get("range")
+    accuracy = int(rng) if isinstance(rng, (int, float)) and rng > 0 else None
+    return {
+        "status": "ok",
+        "lat": resp["lat"],
+        "lon": resp["lon"],
+        "accuracy": accuracy,
+        "radio": (resp.get("radio") or radio or "").upper() or None,
+        "mcc": resp.get("mcc", mcc),
+        "mnc": resp.get("mnc", mnc),
+        "area": resp.get("lac", lac),
+        "cell": resp.get("cellid", ci),
+        "samples": resp.get("samples"),
+        "changeable": resp.get("changeable"),
+        "source": "opencellid",
+    }
+
+
+def call_opencellid(tokens: list[str], mcc: int, mnc: int,
+                    lac: int | None, ci: int,
+                    radio: str | None = None,
+                    exhausted: set[str] | None = None) -> dict:
+    """Lookup sel via OpenCellID API (`/cell/get`).
+
+    Beda penting dari Unwired Labs: `lac` WAJIB di sini (LAC/TAC/network
+    id). Kalau tidak ada, fungsi ini langsung mengembalikan error tanpa
+    memanggil API — jadi tidak membuang kuota.
+
+    Jatah 1.000 request/hari per key. Code 2 (key tidak dikenal) dan 7
+    (kuota harian habis) menandai token exhausted lalu rotate ke token
+    berikutnya; "cell not found" tidak, karena itu bukan soal token.
+
+    Return dict bentuk internal: {"status": "ok", ...} atau
+    {"status": "error", "message": ...}.
+    """
+    import logging
+    log = logging.getLogger("cell_lookup")
+    exhausted = exhausted if exhausted is not None else set()
+
+    if lac is None:
+        return {"status": "error",
+                "message": "OpenCellID butuh LAC/TAC, tapi tidak tersedia."}
+
+    params: dict[str, Any] = {
+        "mcc": mcc, "mnc": mnc, "lac": lac, "cellid": ci, "format": "json",
+    }
+    if radio:
+        params["radio"] = radio.upper()
+
+    last = {"status": "error", "message": "Tidak ada token OpenCellID."}
+
+    for token in tokens:
+        if token in exhausted:
+            continue
+        try:
+            r = requests.get(OCID_API, params=dict(params, key=token),
+                             headers={"User-Agent": USER_AGENT},
+                             timeout=OCID_TIMEOUT)
+            resp = r.json()
+        except requests.RequestException as e:
+            last = {"status": "error", "message": f"Network error: {e}"}
+            continue
+        except ValueError:
+            last = {"status": "error",
+                    "message": f"Respons bukan JSON (HTTP {r.status_code})."}
+            continue
+
+        if not isinstance(resp, dict):
+            last = {"status": "error", "message": "Format respons tak dikenal."}
+            continue
+
+        # Sukses: koordinat ada. Tidak ada field "code" pada respons sukses.
+        if "lat" in resp and "lon" in resp:
+            return _normalize_ocid(resp, mcc, mnc, lac, ci, radio)
+
+        code = resp.get("code")
+        msg = resp.get("error") or f"HTTP {r.status_code}"
+
+        # Kuota habis / key invalid -> token ini tidak berguna, rotate.
+        if code in (2, 7) or r.status_code in (401, 429):
+            log.info("token ...%s OpenCellID ditolak (code %s): %s",
+                     token[-6:], code, msg)
+            exhausted.add(token)
+            last = {"status": "error", "message": msg}
+            continue
+
+        # "Cell not found" (code 1) atau error lain: bukan soal token,
+        # biarkan fallback berikutnya yang mencoba.
+        return {"status": "error", "message": msg}
+
+    return last
+
+
 def reverse_geocode(lat: float, lon: float) -> dict:
     try:
         r = requests.get(NOMINATIM_API,
@@ -381,7 +492,7 @@ class Result:
     address_components: dict = field(default_factory=dict)
     display_name: str = ""
     from_cache: bool = False
-    source: str = ""  # "local_db", "cache", "unwiredlabs"
+    source: str = ""  # "local_db", "cache", "opencellid", "unwiredlabs"
     error: str = ""
 
     @property
@@ -408,16 +519,28 @@ def resolve(mcc: int = 510,
             exhausted: set[str] | None = None,
             use_cache: bool = True,
             use_local_db: bool = True,
-            geocode: bool = True) -> Result:
+            geocode: bool = True,
+            ocid_tokens: list[str] | None = None,
+            ocid_exhausted: set[str] | None = None,
+            use_opencellid: bool | None = None) -> Result:
     """One-shot lookup; returns Result.
 
     Bisa dipanggil dengan:
       - enb & cid (format 4G LTE)
       - lac & ci (format 2G/3G/4G)
       - ci saja (ECI 4G)
+
+    Urutan sumber: database lokal -> cache -> OpenCellID API ->
+    Unwired Labs API. OpenCellID didahulukan karena kuotanya 1.000
+    request/hari (10x Unwired Labs) dan sumbernya sama dengan database
+    lokal, tapi butuh LAC/TAC — kalau tidak ada, lapisan ini dilewati.
     """
     tokens = tokens or []
     exhausted = exhausted if exhausted is not None else set()
+    ocid_tokens = ocid_tokens or []
+    ocid_exhausted = ocid_exhausted if ocid_exhausted is not None else set()
+    if use_opencellid is None:
+        use_opencellid = _env_flag("OCID_LOOKUP", True)
 
     if ci is None:
         if enb is not None and cid is not None:
@@ -466,11 +589,36 @@ def resolve(mcc: int = 510,
         if resp:
             source = "cache"
 
-    # 3. Fallback ke Unwired Labs API jika belum ditemukan
+    # 3. OpenCellID API — butuh LAC/TAC, jatah 1.000 request/hari.
+    #    Didahulukan dari Unwired Labs karena kuotanya 10x lebih besar dan
+    #    sumber datanya sama dengan database lokal, jadi hasilnya konsisten.
+    ocid_error = ""
+    if (resp is None and use_opencellid and ocid_tokens
+            and base.lac is not None):
+        ocid_resp = call_opencellid(tokens=ocid_tokens, mcc=base.mcc,
+                                    mnc=base.mnc, lac=base.lac, ci=base.ci,
+                                    radio=base.radio,
+                                    exhausted=ocid_exhausted)
+        if ocid_resp.get("status") == "ok":
+            resp = ocid_resp
+            source = "opencellid"
+            if use_cache:
+                cache_put(cpath, resp)
+        else:
+            ocid_error = ocid_resp.get("message") or ""
+
+    # 4. Fallback terakhir: Unwired Labs API
     if resp is None:
         if not tokens:
-            base.error = ("Data tidak ditemukan di database lokal dan "
-                          "UWL_TOKEN belum diset.")
+            if ocid_error:
+                base.error = (f"OpenCellID: {ocid_error} · "
+                              "UWL_TOKEN belum diset.")
+            elif base.lac is None and ocid_tokens:
+                base.error = ("Cell tidak ada di database lokal. OpenCellID "
+                              "butuh LAC/TAC · UWL_TOKEN belum diset.")
+            else:
+                base.error = ("Data tidak ditemukan di database lokal dan "
+                              "UWL_TOKEN belum diset.")
             return base
         resp = call_unwiredlabs(tokens=tokens, mcc=base.mcc, mnc=base.mnc,
                                 enb_or_cid=base.ci, lac=base.lac,
@@ -527,6 +675,8 @@ def print_result(r: Result) -> None:
         tag = " (db lokal)"
     elif r.from_cache or r.source == "cache":
         tag = " (cache)"
+    elif r.source == "opencellid":
+        tag = " (OpenCellID)"
     elif r.source == "unwiredlabs":
         tag = " (online API)"
 
@@ -547,6 +697,7 @@ def print_result(r: Result) -> None:
         source_label = {
             "local_db": "Database Lokal (OpenCellID)",
             "cache": "Cache Lokal",
+            "opencellid": "OpenCellID API",
             "unwiredlabs": "Unwired Labs API",
         }.get(r.source, r.source)
         print(f"  Sumber   : {source_label}")
@@ -593,19 +744,35 @@ def main() -> None:
     p.add_argument("--ci", type=int, help="Cell ID (2G/3G) atau ECI (4G)")
     p.add_argument("--token", default=os.environ.get("UWL_TOKEN", ""),
                    help="Token UWL (boleh banyak, dipisah koma)")
+    p.add_argument("--ocid-token", default=os.environ.get("OCID_TOKEN", ""),
+                   help="Token OpenCellID (boleh banyak, dipisah koma)")
     p.add_argument("--no-cache", action="store_true")
     p.add_argument("--no-db", action="store_true", help="Bypass database lokal SQLite")
+    p.add_argument("--no-ocid", action="store_true", help="Bypass OpenCellID API")
     args = p.parse_args()
 
     ensure_db()
 
     tokens = parse_tokens(args.token)
+    ocid_tokens = parse_tokens(args.ocid_token)
     if tokens:
         print(f"[config] {len(tokens)} token UWL siap dipakai")
     else:
-        print("[config] UWL_TOKEN belum diset (pencarian hanya via database lokal)")
+        print("[config] UWL_TOKEN belum diset (tanpa fallback Unwired Labs)")
+    if ocid_tokens:
+        print(f"[config] {len(ocid_tokens)} token OpenCellID siap dipakai")
+    else:
+        print("[config] OCID_TOKEN belum diset (OpenCellID API dilewati)")
 
     exhausted: set[str] = set()
+    ocid_exhausted: set[str] = set()
+    common = dict(
+        tokens=tokens, exhausted=exhausted,
+        ocid_tokens=ocid_tokens, ocid_exhausted=ocid_exhausted,
+        use_cache=not args.no_cache,
+        use_local_db=not args.no_db,
+        use_opencellid=not args.no_ocid,
+    )
     one_shot = (
         (args.enb is not None and args.cid is not None) or
         (args.ci is not None)
@@ -613,7 +780,9 @@ def main() -> None:
 
     while True:
         if tokens and len(exhausted) >= len(tokens):
-            print("\n! Semua token sudah kena limit.")
+            print("\n! Semua token UWL sudah kena limit.")
+        if ocid_tokens and len(ocid_exhausted) >= len(ocid_tokens):
+            print("\n! Semua token OpenCellID sudah kena limit.")
 
         mcc = args.mcc if args.mcc is not None else ask_int("MCC", 510)
         mnc = args.mnc if args.mnc is not None else ask_int("MNC", 10)
@@ -622,24 +791,16 @@ def main() -> None:
             lac = args.lac if args.lac is not None else ask_int("LAC/TAC", 0)
             ci = args.ci if args.ci is not None else ask_int("CI")
             result = resolve(mcc=mcc, mnc=mnc, lac=lac or None, ci=ci,
-                             tokens=tokens, exhausted=exhausted,
-                             use_cache=not args.no_cache,
-                             use_local_db=not args.no_db)
+                             **common)
         else:
             enb = args.enb if args.enb is not None else ask_int("eNB (atau 0 untuk LAC/CI)", 0)
             if enb == 0:
                 lac = ask_int("LAC/TAC")
                 ci = ask_int("CI")
-                result = resolve(mcc=mcc, mnc=mnc, lac=lac, ci=ci,
-                                 tokens=tokens, exhausted=exhausted,
-                                 use_cache=not args.no_cache,
-                                 use_local_db=not args.no_db)
+                result = resolve(mcc=mcc, mnc=mnc, lac=lac, ci=ci, **common)
             else:
                 cid = args.cid if args.cid is not None else ask_int("CID", 1)
-                result = resolve(mcc=mcc, mnc=mnc, enb=enb, cid=cid,
-                                 tokens=tokens, exhausted=exhausted,
-                                 use_cache=not args.no_cache,
-                                 use_local_db=not args.no_db)
+                result = resolve(mcc=mcc, mnc=mnc, enb=enb, cid=cid, **common)
 
         print_result(result)
 

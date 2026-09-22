@@ -67,7 +67,13 @@ INCLUDE_PLUS_CODE = _env_bool("TG_INCLUDE_PLUS_CODE", True)
 INCLUDE_AZIMUTH = _env_bool("TG_INCLUDE_AZIMUTH", True)
 
 UWL_TOKENS = parse_tokens(os.environ.get("UWL_TOKEN", ""))
-EXHAUSTED: set[str] = set()  # token yang sudah kena limit di session ini
+EXHAUSTED: set[str] = set()  # token UWL yang sudah kena limit di session ini
+
+# Token OpenCellID dipisah dari UWL karena kuotanya berbeda (1.000 vs 100
+# request/hari) — token yang habis di satu layanan bisa masih jalan di
+# layanan lain, jadi set exhausted-nya tidak boleh digabung.
+OCID_TOKENS = parse_tokens(os.environ.get("OCID_TOKEN", ""))
+OCID_EXHAUSTED: set[str] = set()
 
 # Per-user rate-limit (in-memory)
 LAST_REQUEST: dict[int, float] = {}
@@ -405,6 +411,9 @@ def render_text(r: Result) -> str:
     elif r.from_cache or r.source == "cache":
         lines.append("")
         lines.append("<i>⚡ Sumber: Cache Lokal</i>")
+    elif r.source == "opencellid":
+        lines.append("")
+        lines.append("<i>🌍 Sumber: OpenCellID API</i>")
     elif r.source == "unwiredlabs":
         lines.append("")
         lines.append("<i>🌐 Sumber: Unwired Labs API</i>")
@@ -484,8 +493,10 @@ async def cell_cmd(update: Update,
             f"⏳ Tunggu {fmt_secs(wait)} lagi sebelum request berikutnya.")
         return
 
-    if not UWL_TOKENS and not DB_PATH.exists():
-        await msg.reply_text("⚠️ Bot belum dikonfigurasi (database lokal & UWL_TOKEN tidak tersedia).")
+    if not UWL_TOKENS and not OCID_TOKENS and not DB_PATH.exists():
+        await msg.reply_text(
+            "⚠️ Bot belum dikonfigurasi (database lokal, OCID_TOKEN, dan "
+            "UWL_TOKEN tidak tersedia).")
         return
 
     log.info("user=%s lookup q=%s", user.id, parsed)
@@ -503,6 +514,8 @@ async def cell_cmd(update: Update,
         radio=parsed.radio,
         tokens=UWL_TOKENS,
         exhausted=EXHAUSTED,
+        ocid_tokens=OCID_TOKENS,
+        ocid_exhausted=OCID_EXHAUSTED,
         use_cache=True,
     )
 
@@ -545,8 +558,10 @@ async def lac_cmd(update: Update,
             f"⏳ Tunggu {fmt_secs(wait)} lagi sebelum request berikutnya.")
         return
 
-    if not UWL_TOKENS and not DB_PATH.exists():
-        await msg.reply_text("⚠️ Bot belum dikonfigurasi (database lokal & UWL_TOKEN tidak tersedia).")
+    if not UWL_TOKENS and not OCID_TOKENS and not DB_PATH.exists():
+        await msg.reply_text(
+            "⚠️ Bot belum dikonfigurasi (database lokal, OCID_TOKEN, dan "
+            "UWL_TOKEN tidak tersedia).")
         return
 
     log.info("user=%s lac lookup q=%s", user.id, parsed)
@@ -561,6 +576,8 @@ async def lac_cmd(update: Update,
         radio=parsed.radio,
         tokens=UWL_TOKENS,
         exhausted=EXHAUSTED,
+        ocid_tokens=OCID_TOKENS,
+        ocid_exhausted=OCID_EXHAUSTED,
         use_cache=True,
     )
 
@@ -636,8 +653,10 @@ async def enb_cmd(update: Update,
             f"⏳ Tunggu {fmt_secs(wait)} lagi sebelum request berikutnya.")
         return
 
-    if not UWL_TOKENS and not DB_PATH.exists():
-        await msg.reply_text("⚠️ Bot belum dikonfigurasi (database lokal & UWL_TOKEN tidak tersedia).")
+    if not UWL_TOKENS and not OCID_TOKENS and not DB_PATH.exists():
+        await msg.reply_text(
+            "⚠️ Bot belum dikonfigurasi (database lokal, OCID_TOKEN, dan "
+            "UWL_TOKEN tidak tersedia).")
         return
 
     log.info("user=%s sweep mcc=%s mnc=%s enb=%s count=%s",
@@ -646,8 +665,14 @@ async def enb_cmd(update: Update,
 
     results: list[Result] = []
     for sector in range(1, count + 1):
+        # Argumen keyword, bukan posisional: urutan parameter resolve()
+        # pernah bergeser saat lac/ci ditambahkan, dan versi posisional
+        # mengirim lac=tokens, ci=exhausted, radio=True sehingga crash.
         r = await asyncio.to_thread(
-            resolve, mcc, mnc, enb, sector, UWL_TOKENS, EXHAUSTED, True)
+            resolve, mcc=mcc, mnc=mnc, enb=enb, cid=sector,
+            tokens=UWL_TOKENS, exhausted=EXHAUSTED,
+            ocid_tokens=OCID_TOKENS, ocid_exhausted=OCID_EXHAUSTED,
+            use_cache=True)
         results.append(r)
 
     ok_results = [r for r in results if r.ok]
@@ -672,6 +697,8 @@ async def enb_cmd(update: Update,
                 tag = " <i>(db lokal)</i>"
             elif r.from_cache or r.source == "cache":
                 tag = " <i>(cache)</i>"
+            elif r.source == "opencellid":
+                tag = " <i>(OpenCellID)</i>"
             elif r.source == "unwiredlabs":
                 tag = " <i>(online API)</i>"
             else:
@@ -754,6 +781,8 @@ async def batch_cmd(update: Update,
             radio=q.radio,
             tokens=UWL_TOKENS,
             exhausted=EXHAUSTED,
+            ocid_tokens=OCID_TOKENS,
+            ocid_exhausted=OCID_EXHAUSTED,
             use_cache=True,
             use_local_db=True,
             geocode=False,
@@ -768,7 +797,14 @@ async def batch_cmd(update: Update,
         if r.ok:
             found_count += 1
             az_str = f" · 🧭 ~{r.azimuth:.0f}°" if r.azimuth is not None else ""
-            src_tag = "📁 db" if r.source == "local_db" else ("⚡ cache" if r.from_cache else "🌐 api")
+            if r.source == "local_db":
+                src_tag = "📁 db"
+            elif r.from_cache or r.source == "cache":
+                src_tag = "⚡ cache"
+            elif r.source == "opencellid":
+                src_tag = "🌍 opencellid"
+            else:
+                src_tag = "🌐 api"
             acc_str = f" (±{r.accuracy}m)" if r.accuracy is not None else ""
 
             if r.radio.upper() == "LTE":

@@ -169,7 +169,18 @@ Aplikasi dilengkapi dukungan database lokal berbasis SQLite (`data/cells.db`) ya
 ### Hirarki Pencarian:
 1. **Database Lokal** (`data/cells.db`): Mencari data offline dari OpenCellID.
 2. **Cache File** (`cache/*.json`): Mengambil hasil query sebelumnya jika ada.
-3. **Unwired Labs API**: Fallback ke online API jika tower belum ada di database lokal.
+3. **OpenCellID API** (`opencellid.org/cell/get`): Lookup online, jatah
+   **1.000 request/hari** per token. Butuh `OCID_TOKEN` dan **LAC/TAC** —
+   kalau TAC tidak diketahui (misal hanya eNB + sektor), lapisan ini
+   dilewati. Keunggulan: mencakup **seluruh dunia**, bukan cuma MCC 510
+   seperti database lokal.
+4. **Unwired Labs API**: Fallback terakhir, jatah 100 request/hari.
+   Bisa lookup tanpa LAC.
+
+Urutan ini sengaja menaruh OpenCellID sebelum Unwired Labs: kuotanya 10x
+lebih besar, dan sumber datanya sama dengan database lokal sehingga
+hasilnya konsisten. Set `OCID_LOOKUP=0` untuk menyimpan kuota OpenCellID
+hanya bagi unduhan database harian.
 
 ### Impor Manual (Indonesia atau Seluruh Dunia):
 Database otomatis dibuat saat bot atau CLI pertama kali dijalankan. Anda juga dapat mengimpor data manual atau memperbarui dengan dump CSV terbaru (misal `cell_towers_*.csv`):
