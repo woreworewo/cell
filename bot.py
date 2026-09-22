@@ -14,15 +14,19 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import hashlib
+import io
+import json
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
-from telegram import (InlineKeyboardButton, InlineKeyboardMarkup,
+from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
                       LinkPreviewOptions, Update)
-from telegram.constants import ParseMode
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
 
@@ -74,6 +78,23 @@ EXHAUSTED: set[str] = set()  # token UWL yang sudah kena limit di session ini
 # layanan lain, jadi set exhausted-nya tidak boleh digabung.
 OCID_TOKENS = parse_tokens(os.environ.get("OCID_TOKEN", ""))
 OCID_EXHAUSTED: set[str] = set()
+
+# Alamat untuk /batch. Nominatim membatasi ~1 request/detik tanpa API key,
+# jadi jumlah cell yang di-geocode dibatasi dan jedanya dipaksa di sini.
+BATCH_GEOCODE_MAX = _env_int("TG_BATCH_GEOCODE_MAX", 5)
+BATCH_ADDR_MAXLEN = _env_int("TG_BATCH_ADDR_MAXLEN", 70)
+
+# Cache alamat, kunci = koordinat dibulatkan 4 desimal (~11 m). Tower yang
+# sama sering di-lookup berulang, dan tanpa cache tiap /batch membayar
+# ~1 detik Nominatim per cell.
+GEO_CACHE_DIR = Path(__file__).with_name("cache") / "geo"
+GEO_CACHE_TTL = 30 * 24 * 3600  # 30 hari, samakan dengan cache lookup
+
+# Nominatim meminta maksimal 1 request/detik. Lock ini berlaku untuk
+# seluruh proses, jadi /batch dan /nearby tidak bisa saling menabrak.
+_GEO_LOCK = threading.Lock()
+_GEO_LAST = 0.0
+GEO_MIN_INTERVAL = 1.1  # sedikit di atas 1 detik untuk margin
 
 # Per-user rate-limit (in-memory)
 LAST_REQUEST: dict[int, float] = {}
@@ -357,6 +378,157 @@ def render_nearby(lat: float, lon: float, radius_m: float,
     return "\n".join(lines)
 
 
+def fmt_short_addr(r: Result) -> str:
+    """Alamat satu baris untuk /batch, dipotong BATCH_ADDR_MAXLEN.
+
+    Urutan field disesuaikan dengan keluaran Nominatim untuk Indonesia:
+    `village` itu kelurahan dan `suburb` kecamatan, sedangkan kota
+    (mis. "Jakarta Pusat") ada di `city_district` — `city` justru berisi
+    nama provinsi ("Daerah Khusus Ibukota Jakarta"), jadi jangan dipakai
+    lebih dulu.
+    """
+    addr = r.address_components or {}
+    parts: list[str] = []
+
+    def add(value: object) -> None:
+        text = str(value).strip() if value else ""
+        if text and text not in parts:
+            parts.append(text)
+
+    # Nama tempat (mal, kantor, pasar) paling informatif kalau ada.
+    add(addr.get("amenity") or addr.get("building") or addr.get("shop"))
+    add(addr.get("road"))
+    for key in ("neighbourhood", "village", "suburb", "town"):
+        if addr.get(key):
+            add(addr[key])
+            break
+    for key in ("city_district", "city", "municipality", "county"):
+        if addr.get(key):
+            add(addr[key])
+            break
+    add(addr.get("country"))
+
+    # Kalau kepanjangan, buang segmen paling belakang utuh daripada
+    # memotong di tengah kata ("Jakarta Pusat, I…"). Dipotong keras hanya
+    # kalau segmen pertama saja sudah melewati batas.
+    while parts and len(", ".join(parts)) > BATCH_ADDR_MAXLEN:
+        parts.pop()
+    text = ", ".join(parts)
+    if not text:
+        text = re.sub(r"\s+", " ", r.display_name or "").strip()
+    if not text:
+        return ""
+    if len(text) > BATCH_ADDR_MAXLEN:
+        text = text[:BATCH_ADDR_MAXLEN - 1].rstrip() + "…"
+    return text
+
+
+def geocode_cached(lat: float, lon: float) -> dict:
+    """Reverse geocode dengan cache + throttle global.
+
+    Kembalikan dict Nominatim mentah; {} kalau gagal. Yang TIDAK di-cache
+    hanya kegagalan transport/parse (reverse_geocode mengembalikan {}).
+    Jawaban Nominatim tetap di-cache walau isinya error — mis. titik di
+    tengah laut dibalas {"error": "Unable to geocode"} — karena itu
+    jawaban final, bukan gangguan sesaat, dan menyimpannya menghemat
+    kuota saat titik yang sama di-lookup lagi.
+    """
+    from cell_lookup import reverse_geocode
+
+    key = f"{lat:.4f},{lon:.4f}"  # ~11 m, cukup khas per tower
+    path = GEO_CACHE_DIR / f"{hashlib.sha1(key.encode()).hexdigest()[:16]}.json"
+    if path.exists() and time.time() - path.stat().st_mtime <= GEO_CACHE_TTL:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass  # rusak -> anggap tidak ada, ambil ulang
+
+    global _GEO_LAST
+    # Lock dipegang termasuk saat sleep: tanpa itu dua pemanggil
+    # concurrent sama-sama melihat interval terpenuhi lalu menembak
+    # Nominatim bersamaan.
+    with _GEO_LOCK:
+        gap = time.time() - _GEO_LAST
+        if gap < GEO_MIN_INTERVAL:
+            time.sleep(GEO_MIN_INTERVAL - gap)
+        geo = reverse_geocode(lat, lon)
+        _GEO_LAST = time.time()
+
+    if not geo:
+        return {}
+    try:
+        GEO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(geo, ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        log.warning("cache alamat gagal ditulis (%s): %s", path.name, e)
+    return geo
+
+
+def build_batch_txt(results: list[Result], geocoded: int) -> str:
+    """Susun hasil /batch sebagai teks biasa (tanpa tag HTML).
+
+    Format teks polos supaya enak dibaca di notepad dan tidak ada tag yang
+    bocor kalau user membukanya di tempat lain. Yang di-geocode hanya
+    `geocoded` cell pertama; sisanya cuma koordinat, sesuai batas
+    TG_BATCH_GEOCODE_MAX.
+    """
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    found = sum(1 for r in results if r.ok)
+    if geocoded:
+        addr_note = f"{geocoded} cell pertama (batas TG_BATCH_GEOCODE_MAX)"
+    else:
+        addr_note = "tidak diambil (TG_BATCH_GEOCODE_MAX=0 atau semua gagal)"
+    out = [
+        "LTE CELL LOOKUP — HASIL BATCH",
+        f"Waktu    : {stamp}",
+        f"Total    : {len(results)} cell ({found} ditemukan)",
+        f"Alamat   : {addr_note}",
+        "=" * 60,
+        "",
+    ]
+
+    for i, r in enumerate(results, 1):
+        op = r.operator or f"MCC {r.mcc}"
+        out.append(f"[{i}] {op} — MCC/MNC {r.mcc}/{r.mnc:02d}")
+        if r.radio.upper() == "LTE" and r.enb is not None:
+            ident = f"eNB {r.enb} / Sektor {r.cid} (ECI {r.cid_full})"
+            if r.lac is not None:
+                ident += f" / TAC {r.lac}"
+        else:
+            ident = f"{r.radio} "
+            if r.lac is not None:
+                ident += f"LAC {r.lac} / "
+            ident += f"CI {r.cid_full}"
+        out.append(f"    Identitas : {ident}")
+
+        if not r.ok:
+            out.append(f"    Status    : TIDAK DITEMUKAN — {r.error}")
+            out.append("")
+            continue
+
+        acc = f" (+/- {r.accuracy} m)" if r.accuracy is not None else ""
+        out.append(f"    Koordinat : {r.lat}, {r.lon}{acc}")
+        out.append(f"    Google Maps: https://www.google.com/maps?q={r.lat},{r.lon}")
+        if INCLUDE_PLUS_CODE and r.plus_code:
+            out.append(f"    Plus Code : {r.plus_code}")
+        if INCLUDE_AZIMUTH and r.azimuth is not None:
+            out.append(f"    Azimuth   : ~{r.azimuth:.0f} derajat "
+                       f"({r.azimuth_label})")
+
+        addr = fmt_short_addr(r)
+        out.append(f"    Alamat    : {addr}" if addr
+                   else "    Alamat    : (tidak tersedia)")
+
+        src = {"local_db": "database lokal", "cache": "cache",
+               "opencellid": "OpenCellID API"}.get(r.source, "Unwired Labs API")
+        out.append(f"    Sumber    : {src}")
+        out.append("")
+
+    out.append("=" * 60)
+    out.append(f"Berhasil: {found}/{len(results)} cell.")
+    return "\n".join(out)
+
+
 def render_text(r: Result) -> str:
     lines = [
         f"<b>📡 {r.country} — {r.operator}</b>",
@@ -447,7 +619,7 @@ HELP_TEXT = (
     "• <code>/lac &lt;lac&gt; &lt;ci&gt;</code> — lookup via LAC dan CI (2G/3G/4G)\n"
     "• <code>/cell &lt;mcc&gt; &lt;mnc&gt; &lt;enb/lac&gt; &lt;cid/ci&gt;</code> — format lengkap\n"
     "• <code>/enb &lt;enb&gt;</code> — sweep semua sektor untuk 1 eNB LTE\n"
-    "• <code>/batch</code> — lookup banyak cell sekaligus (maks 20)\n"
+    "• <code>/batch</code> — lookup banyak cell sekaligus (maks 20), hasilnya dikirim sebagai file .txt\n"
     "• <code>/nearby [radius]</code> — cari tower terdekat dari lokasi Anda\n\n"
     "<b>Fitur Pintar:</b>\n"
     "• Mendukung desimal maupun heksadesimal (0x...).\n"
@@ -767,7 +939,8 @@ async def batch_cmd(update: Update,
 
     log.info("user=%s batch lookup %d cells", user.id, len(cells))
 
-    # Resolve tanpa geocoding untuk kecepatan instan
+    # Resolve tanpa geocoding supaya cepat; alamat diurus terpisah di
+    # bawah hanya untuk BATCH_GEOCODE_MAX cell pertama.
     results: list[Result] = []
     for q in cells:
         r = await asyncio.to_thread(
@@ -789,55 +962,44 @@ async def batch_cmd(update: Update,
         )
         results.append(r)
 
-    lines = [f"<b>📋 Hasil Batch Lookup ({len(results)} Cell):</b>\n"]
-    found_count = 0
+    found_count = sum(1 for r in results if r.ok)
 
-    for i, r in enumerate(results, 1):
-        op_tag = r.operator or f"MCC {r.mcc}"
-        if r.ok:
-            found_count += 1
-            az_str = f" · 🧭 ~{r.azimuth:.0f}°" if r.azimuth is not None else ""
-            if r.source == "local_db":
-                src_tag = "📁 db"
-            elif r.from_cache or r.source == "cache":
-                src_tag = "⚡ cache"
-            elif r.source == "opencellid":
-                src_tag = "🌍 opencellid"
-            else:
-                src_tag = "🌐 api"
-            acc_str = f" (±{r.accuracy}m)" if r.accuracy is not None else ""
+    # Alamat: hanya untuk cell yang berhasil, dibatasi jumlahnya, dan
+    # dengan jeda 1,1 detik supaya tidak kena HTTP 429 Nominatim.
+    # Geocoding menahan respons ~5 detik, jadi kirim indikator typing
+    # dulu supaya user tahu bot masih bekerja.
+    geocodable = sum(1 for r in results
+                     if r.ok and INCLUDE_ADDRESS and r.lat is not None)
+    if geocodable:
+        try:
+            await msg.chat.send_action(ChatAction.TYPING)
+        except Exception as e:  # bukan alasan menggagalkan hasil
+            log.debug("gagal kirim typing action: %s", e)
 
-            if r.radio.upper() == "LTE":
-                ident = f"eNB <code>{r.enb}</code> · S<code>{r.cid}</code> (ECI <code>{r.cid_full}</code>)"
-                if r.lac:
-                    ident += f" · TAC: <code>{r.lac}</code>"
-            else:
-                lac_str = f"LAC <code>{r.lac}</code> · " if r.lac else ""
-                ident = f"<b>{r.radio}</b> {lac_str}CI <code>{r.cid_full}</code>"
+    geocoded = 0
+    for r in results:
+        if geocoded >= BATCH_GEOCODE_MAX:
+            break
+        if not (r.ok and INCLUDE_ADDRESS and r.lat is not None):
+            continue
+        geo = await asyncio.to_thread(geocode_cached, r.lat, r.lon)
+        if geo:
+            r.address_components = geo.get("address") or {}
+            r.display_name = geo.get("display_name") or r.display_name
+        geocoded += 1
 
-            lines.append(
-                f"<b>{i}. {op_tag}</b> (<code>{r.mcc}/{r.mnc:02d}</code>)\n"
-                f"   {ident}\n"
-                f"   📍 <a href=\"https://www.google.com/maps?q={r.lat},{r.lon}\">{r.lat}, {r.lon}</a>{acc_str}{az_str}\n"
-                f"   <i>[{src_tag}]</i>"
-            )
-        else:
-            if r.radio.upper() == "LTE" and r.enb is not None:
-                ident = f"eNB <code>{r.enb}</code> · S<code>{r.cid}</code>"
-            else:
-                lac_str = f"LAC <code>{r.lac}</code> " if r.lac else ""
-                ident = f"{lac_str}CI <code>{r.cid_full}</code>"
-            lines.append(
-                f"<b>{i}. {op_tag}</b> (<code>{r.mcc}/{r.mnc:02d}</code>)\n"
-                f"   {ident} ❌ {r.error}"
-            )
-        lines.append("")
+    # Hasil dikirim sebagai file .txt, bukan pesan: 20 cell + alamat bisa
+    # lewat batas 4096 karakter Telegram, dan teks panjang lebih enak
+    # dibaca dari editor.
+    txt = build_batch_txt(results, geocoded)
+    buf = io.BytesIO(txt.encode("utf-8"))
+    buf.name = f"batch_{time.strftime('%Y%m%d-%H%M%S')}.txt"
 
-    lines.append(f"<i>Berhasil: {found_count}/{len(results)} cell.</i>")
-    await msg.reply_text(
-        "\n".join(lines),
+    await msg.reply_document(
+        document=InputFile(buf, filename=buf.name),
+        caption=(f"📋 <b>Hasil batch: {found_count}/{len(results)} cell</b>\n"
+                 f"<i>{geocoded} cell pertama disertai alamat.</i>"),
         parse_mode=ParseMode.HTML,
-        link_preview_options=LinkPreviewOptions(is_disabled=True)
     )
 
 

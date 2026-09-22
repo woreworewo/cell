@@ -118,7 +118,7 @@ Di chat dengan bot:
 - `/cell 18724 49384` - otomatis dideteksi sebagai LAC+CI karena CI > 255
 - `/cell 0x4924 0xC0E8` - mendukung format heksadesimal dari modem / AT Command
 - `/enb 11071` - sweep semua sektor sekaligus untuk 1 eNB LTE, list azimuth tiap sektor
-- `/batch` - lookup banyak cell sekaligus (maks 20 cell, bisa kombinasi eNB+CID maupun LAC+CI)
+- `/batch` - lookup banyak cell sekaligus (maks 20 cell, bisa kombinasi eNB+CID maupun LAC+CI). Hasil dikirim sebagai **file `.txt`**, bukan pesan
 - `/nearby [radius]` - cari semua tower di sekitar koordinat/lokasi Anda
 - `/start` atau `/help` - bantuan
 
@@ -138,6 +138,32 @@ Bot membalas dengan:
 - Telegram Location native (titik di peta dalam chat)
 - Tombol inline ke Google / OSM / Bing / Waze / Apple Maps
 
+### Hasil `/batch` berupa file `.txt`
+
+Kalau cell yang di-lookup banyak, hasilnya dikirim sebagai dokumen
+`batch_YYYYmmdd-HHMMSS.txt` dengan caption ringkasan. Alasannya bukan
+sekadar kerapian:
+
+- **Batas 4096 karakter Telegram.** 20 cell lengkap dengan alamat bisa
+  melewatinya, dan pesan yang kepanjangan gagal terkirim sama sekali.
+  Dengan file, tidak ada batas praktis.
+- **Google Maps jadi URL utuh** yang bisa diklik dari notepad, tidak
+  disembunyikan di balik teks koordinat seperti di pesan HTML.
+
+Isi tiap cell: operator, MCC/MNC, identitas (eNB/sektor/TAC atau LAC/CI),
+koordinat + akurasi, link Google Maps, Plus Code, azimuth, alamat, dan
+sumber datanya.
+
+**Alamat dibatasi jumlahnya.** Nominatim membatasi ~1 request/detik tanpa
+API key, jadi 20 alamat berarti ~20 detik menunggu dan rawan HTTP 429.
+Alamat hanya diambil untuk `TG_BATCH_GEOCODE_MAX` cell pertama (default
+5); sisanya tetap dapat koordinat dan link peta. Hasilnya juga di-cache
+30 hari di `cache/geo/`, jadi batch yang sama diulang jadi instan.
+
+Set `TG_BATCH_GEOCODE_MAX=0` untuk mematikan alamat di `/batch` sama
+sekali (paling cepat), atau naikkan (mis. 20) kalau tidak masalah
+menunggu ~20 detik.
+
 ### Konfigurasi `.env`
 
 | Variable | Default | Deskripsi |
@@ -152,6 +178,8 @@ Bot membalas dengan:
 | `TG_INCLUDE_MAP_BUTTONS` | 1 | Tombol map links. |
 | `TG_INCLUDE_PLUS_CODE` | 1 | Tampilkan Plus Code. |
 | `TG_INCLUDE_AZIMUTH` | 1 | Tampilkan estimasi arah pancar sektor. |
+| `TG_BATCH_GEOCODE_MAX` | 5 | Jumlah cell pertama di `/batch` yang dicari alamatnya. 0 = matikan. |
+| `TG_BATCH_ADDR_MAXLEN` | 70 | Panjang maksimal satu baris alamat di file `.txt`. |
 | `SECTOR_AZIMUTHS` | 0,120,240 | Override azimuth global (CSV). |
 | `SECTOR_AZIMUTHS_<MCC>_<MNC>` | - | Override per operator. |
 
